@@ -9,6 +9,12 @@ void NetGenericSync(SLONG SyncId);
 void NetGenericSync(SLONG SyncId, SLONG Par);
 void NetGenericAsync(SLONG SyncId, SLONG Par, SLONG player = -1);
 
+// Checksum trailer of all network messages (see NewGamePopup.cpp)
+class TEAKFILE;
+ULONG NetChecksum(const UBYTE *pData, ULONG Size);
+bool NetSendWithChecksum(TEAKFILE &file, ULONG target, bool useCompression);
+bool NetCheckAndStripChecksum(const UBYTE *p, ULONG &Size);
+
 // Messages for creating a new game
 static const ULONG ATNET_WANNAJOIN = 0xadaa0000;        // Server, I want to join, Please send list of players and their names
 static const ULONG ATNET_SORRYFULL = 0xadaa0001;        // Server: Sorry, you can't join: too many players

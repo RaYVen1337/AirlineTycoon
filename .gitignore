@@ -21,3 +21,5 @@ gamefiles/*
 .vscode
 !.vscode/extensions.json
 .DS_Store
+build-*/
+

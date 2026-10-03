@@ -163,6 +163,14 @@ BOOL bLeaveGameLoop = FALSE;      // Hauptschleife verlassen?
 BOOL bFirstClass = FALSE;
 SLONG gAutoQuitOnDay = -1;
 SLONG gAutoBotDiff = 0;
+SLONG gNetTestMode = 0;
+CString gNetTestIP = "127.0.0.1";
+SLONG gNetTestPort = 60011;
+SLONG gNetTestDays = 3;
+SLONG gNetTestSpeed = 5;
+SLONG gNetTestMonkey = 0;
+SLONG gNetTestTurbo = 1;
+SLONG gNetTestFuzz = 0;
 
 //--------------------------------------------------------------------------------------------
 // Das Spiel höchstpersönlich:

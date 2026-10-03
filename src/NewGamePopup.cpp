@@ -183,6 +183,10 @@ void NewGamePopup::Konstruktor(BOOL /*bHandy*/, SLONG /*PlayerNum*/) {
     Sim.Options.OptionLastPlayer = 1;
 #endif
 
+    if (gNetTestMode != 0) {
+        Sim.Options.OptionLastPlayer = (gNetTestMode == 1) ? 0 : 1; // host = player 0, client = player 1
+    }
+
     Limit(SLONG(0), Sim.Options.OptionLastPlayer, SLONG(3));
 
     for (c = 0; c < 4; c++) {
@@ -789,6 +793,10 @@ void NewGamePopup::CheckNames() {
 // NewGamePopup::OnPaint
 //--------------------------------------------------------------------------------------------
 void NewGamePopup::OnPaint() {
+    if (gNetTestMode != 0) {
+        NetTestStep();
+    }
+
     static SLONG x;
     static SLONG y;
     static SLONG py;
@@ -2112,14 +2120,14 @@ void NewGamePopup::CheckNetEvents() {
                             Message.Announce(30);
                             Message << ATNET_SORRYFULL;
 
-                            gNetwork.Send(Message.MemBuffer, Message.MemBufferUsed, SenderID, false);
+                            NetSendWithChecksum(Message, SenderID, false);
                         } else if (gNetworkSavegameLoading != -1 && MessageType == ATNET_WANNAJOIN) {
                             TEAKFILE Message;
 
                             Message.Announce(30);
                             Message << ATNET_SAVGEGAMECHECK << gNetworkSavegameLoading << Sim.GetSavegameUniqueGameId(gNetworkSavegameLoading, true);
 
-                            gNetwork.Send(Message.MemBuffer, Message.MemBufferUsed, SenderID, false);
+                            NetSendWithChecksum(Message, SenderID, false);
                         } else {
                             SLONG WantedIndex = 0;
                             Message >> WantedIndex;
@@ -2135,7 +2143,7 @@ void NewGamePopup::CheckNetEvents() {
                                     Message.Announce(30);
                                     Message << ATNET_SORRYVERSION;
 
-                                    gNetwork.Send(Message.MemBuffer, Message.MemBufferUsed, SenderID, false);
+                                    NetSendWithChecksum(Message, SenderID, false);
                                     return;
                                 }
                             }
@@ -2146,7 +2154,7 @@ void NewGamePopup::CheckNetEvents() {
                                 Message.Announce(30);
                                 Message << ATNET_WANNAJOIN2NO;
 
-                                gNetwork.Send(Message.MemBuffer, Message.MemBufferUsed, SenderID, false);
+                                NetSendWithChecksum(Message, SenderID, false);
                                 return;
                             }
 
@@ -2731,15 +2739,87 @@ void NewGamePopup::PushName(SLONG n) {
 //--------------------------------------------------------------------------------------------
 //
 //--------------------------------------------------------------------------------------------
+//--------------------------------------------------------------------------------------------
+// Every game message gets a trailer: magic + CRC32 of the payload. A message that was damaged
+// on its way (issue #29: 3 shifted bytes in a routes sync) is dropped instead of being applied.
+// Messages without the trailer (older versions, lobby replies) are still accepted.
+//--------------------------------------------------------------------------------------------
+static const ULONG NetChecksumMagic = 0x4B435441; // "ATCK"
+static bool gNetPeerUsesChecksum = false;          // once a peer sent a trailer, all its messages need one
+
+ULONG NetChecksum(const UBYTE *pData, ULONG Size) {
+    static ULONG Table[256];
+    static bool bInit = false;
+    if (!bInit) {
+        for (ULONG c = 0; c < 256; c++) {
+            ULONG v = c;
+            for (SLONG k = 0; k < 8; k++) {
+                v = ((v & 1) != 0U) ? (0xEDB88320 ^ (v >> 1)) : (v >> 1);
+            }
+            Table[c] = v;
+        }
+        bInit = true;
+    }
+    ULONG crc = 0xFFFFFFFF;
+    for (ULONG c = 0; c < Size; c++) {
+        crc = Table[(crc ^ pData[c]) & 0xFF] ^ (crc >> 8);
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
 bool SIM::SendMemFile(TEAKFILE &file, ULONG target, bool useCompression) {
     useCompression = false;
     // ULONG eventId = (file.MemBuffer[3] << 24) | (file.MemBuffer[2] << 16) | (file.MemBuffer[1] << 8) | (file.MemBuffer[0]);
     // AT_Log_I("NET", "Send Event: %s (%x) TO: %x", Translate_ATNET(eventId), eventId, target);
 
     if (((Sim.bNetwork != 0) || (bNetworkUnderway != 0)) && gNetwork.IsInSession()) {
-        return gNetwork.Send(file.MemBuffer, file.MemBufferUsed, target, useCompression);
+        return NetSendWithChecksum(file, target, useCompression);
     }
     return (false);
+}
+
+bool NetSendWithChecksum(TEAKFILE &file, ULONG target, bool useCompression) {
+    const ULONG Size = file.MemBufferUsed;
+    BUFFER<UBYTE> Buffer(static_cast<SLONG>(Size + 8));
+    if (Size > 0) {
+        memcpy(Buffer, file.MemBuffer, Size);
+    }
+    const ULONG Trailer[2] = {NetChecksumMagic, NetChecksum(Buffer, Size)};
+    memcpy(Buffer + Size, Trailer, sizeof(Trailer));
+    return gNetwork.Send(Buffer, Size + 8, target, useCompression);
+}
+
+// Returns false if the message is damaged. Otherwise Size is reduced by the trailer (if there is one).
+bool NetCheckAndStripChecksum(const UBYTE *p, ULONG &Size) {
+    if (p == nullptr) {
+        return true;
+    }
+    if (Size >= 8) {
+        ULONG Trailer[2];
+        memcpy(Trailer, p + Size - 8, sizeof(Trailer));
+        if (Trailer[0] == NetChecksumMagic) {
+            if (Trailer[1] != NetChecksum(p, Size - 8)) {
+                AT_Log_I("NET", "Dropping damaged network message (%lu bytes, checksum mismatch)", static_cast<unsigned long>(Size));
+                return false;
+            }
+            Size -= 8;
+            gNetPeerUsesChecksum = true;
+            return true;
+        }
+    }
+    // No trailer: an older version or a message generated by the network layer itself
+    if (Size == sizeof(DPPacket)) {
+        ULONG MessageType = 0;
+        memcpy(&MessageType, p, sizeof(MessageType));
+        if (MessageType == DPSYS_HOST || MessageType == DPSYS_SESSIONLOST || MessageType == DPSYS_DESTROYPLAYERORGROUP) {
+            return true;
+        }
+    }
+    if (gNetPeerUsesChecksum) {
+        AT_Log_I("NET", "Dropping damaged network message (%lu bytes, checksum missing)", static_cast<unsigned long>(Size));
+        return false;
+    }
+    return true;
 }
 
 //--------------------------------------------------------------------------------------------
@@ -2829,12 +2909,177 @@ bool SIM::ReceiveMemFile(TEAKFILE &file) {
 
     bool rc = gNetwork.Receive(&p, Size);
 
+    if (rc && !NetCheckAndStripChecksum(p, Size)) {
+        delete[] p;
+        p = nullptr;
+        Size = 0;
+        rc = false;
+    }
+
     file.MemBufferUsed = Size;
     file.MemPointer = 0;
 
     if ((p != nullptr) && (Size != 0U)) {
         file.MemBuffer.ReSize(Size, p);
+    } else if (p != nullptr) {
+        delete[] p;
     }
 
     return (rc);
+}
+
+//--------------------------------------------------------------------------------------------
+// /nettest harness: drive the menus (Direct-IP host / join) without a human.
+// Host:   Netzwerkspiel -> Direct-IP Host -> create session -> wait for the client -> bots -> Los
+// Client: Netzwerkspiel -> Direct-IP Join -> connect to 127.0.0.1 -> wait for BEGINGAME
+// Synthetic mouse clicks are used wherever possible so the normal code paths (and net messages) are exercised.
+//--------------------------------------------------------------------------------------------
+void NewGamePopup::NetTestClick(SLONG Column, SLONG Line) {
+    gMousePosition = XY(128 + Column * 16 + 4, 63 + Line * 22 + 4);
+    OnLButtonDown(0, CPoint(gMousePosition.x, gMousePosition.y));
+}
+
+static void NetTestFail(int code, const char *msg) {
+    AT_Log_I("NETTEST", "FAILED: %s (exit %d)", msg, code);
+    fflush(nullptr);
+    _exit(code);
+}
+
+void NewGamePopup::NetTestStep() {
+    if (gNetTestMode == 0 || MenuIsOpen() != 0) {
+        return;
+    }
+
+    static PAGE_TYPE LastPage = PAGE_TYPE::HIGHSCORES;
+    static ULONG LastPageChange = 0;
+    const ULONG now = AtGetTime();
+
+    if (LastPageChange == 0 || PageNum != LastPage) {
+        AT_Log_I("NETTEST", "menu page %d", static_cast<int>(PageNum));
+        LastPage = PageNum;
+        LastPageChange = now;
+    } else if (now - LastPageChange > 120000) {
+        NetTestFail(4, "stuck in menu for 120s");
+    }
+
+    if (now < NetTestNextAt) {
+        return;
+    }
+    NetTestNextAt = now + 250;
+
+    const bool host = (gNetTestMode == 1);
+
+    switch (PageNum) {
+    case PAGE_TYPE::MAIN_MENU: {
+        const SBProviderEnum wanted = host ? SBProviderEnum::SBNETWORK_RAKNET_DIRECT_HOST : SBProviderEnum::SBNETWORK_RAKNET_DIRECT_JOIN;
+
+        PageNum = PAGE_TYPE::MULTIPLAYER_SELECT_NETWORK;
+        Selection = Sim.Options.OptionLastProvider;
+        bNetworkUnderway = TRUE;
+        RefreshKlackerField(); // fills pNetworkConnections / NetMediumMapper
+
+        SLONG idx = -1;
+        for (SLONG c = 0; c < static_cast<SLONG>(pNetworkConnections->GetNumberOfElements()); c++) {
+            SBStr name = pNetworkConnections->Get(c + 1);
+            if (SBNetwork::GetProviderID(const_cast<char *>(name.c_str())) == wanted) {
+                idx = c;
+                break;
+            }
+        }
+        if (idx < 0) {
+            NetTestFail(5, "Direct-IP provider not found");
+        }
+
+        NetTestClick(1, 2 + idx); // select provider line
+        if (Selection != idx) {
+            NetTestFail(5, "provider selection failed");
+        }
+
+        if (host) {
+            srand(12345);
+            NetTestClick(18, 15); // Weiter -> PRE_SESSION
+            Sim.StartTime = 820454400; // fixed start date for reproducibility
+        } else {
+            // same as the "Weiter" + MENU_ENTERTCPIP + OnTimer path, but without the dialog and on the main thread
+            Sim.StartTime = 820454400;
+            SBStr name = pNetworkConnections->Get(NetMediumMapper[Selection] + 1);
+            gNetwork.SetProvider(wanted);
+            gNetwork.SetMasterServer(Sim.Options.OptionMasterServer);
+
+            if (!gNetwork.Connect(name, const_cast<char *>((LPCTSTR)gNetTestIP))) {
+                NetTestFail(3, "could not connect to host");
+            }
+
+            hprintf("This computer is client.");
+
+            NewgameWantsToLoad = FALSE;
+            gNetworkSavegameLoading = -1;
+            bThisIsSessionMaster = false;
+
+            for (SLONG d = 0; d < 4; d++) {
+                Sim.Players.Players[d].NetworkID = 0;
+            }
+            Sim.Players.Players[Sim.Options.OptionLastPlayer].NetworkID = gNetwork.GetLocalPlayerID();
+
+            TEAKFILE Message;
+            Message.Announce(30);
+            Message << ATNET_WANNAJOIN << gNetwork.GetLocalPlayerID() << Sim.Options.OptionLastPlayer << CString(VersionString);
+            SIM::SendMemFile(Message);
+
+            PageNum = PAGE_TYPE::SELECT_PLAYER_MULTIPLAYER;
+            RefreshKlackerField();
+        }
+    } break;
+
+    case PAGE_TYPE::MULTIPLAYER_PRE_SESSION:
+        if (host) {
+            NetTestClick(1, 6); // Neue Session
+        }
+        break;
+
+    case PAGE_TYPE::MULTIPLAYER_CREATE_SESSION:
+        if (host) {
+            NetTestClick(18, 15); // Weiter -> CreateSession
+            if (PageNum != PAGE_TYPE::SELECT_PLAYER_MULTIPLAYER) {
+                NetTestFail(6, "CreateSession failed");
+            }
+            Sim.UniqueGameId = 0x1234567;
+        }
+        break;
+
+    case PAGE_TYPE::SELECT_PLAYER_MULTIPLAYER:
+        if (host) {
+            SLONG numClients = 0;
+            for (SLONG c = 0; c < 4; c++) {
+                if (Sim.Players.Players[c].Owner == 2) {
+                    numClients++;
+                }
+            }
+            if (numClients > 0 && (pNetworkPlayers != nullptr) && pNetworkPlayers->GetNumberOfElements() > 1 && PlayerReadyAt <= now) {
+                NetTestClick(18, 15); // Weiter -> SELECT_BOT_NETWORK (sends ATNET_BOTSELECT)
+            }
+        }
+        break;
+
+    case PAGE_TYPE::SELECT_BOT_NETWORK:
+        if (host) {
+            if (NetTestSetupDone == 0) {
+                NetTestSetupDone = 1;
+                for (SLONG c = 0; c < 4; c++) {
+                    if (Sim.Players.Players[c].Owner == 1) {
+                        Sim.Players.Players[c].BotLevel = gAutoBotDiff > 0 ? (gAutoBotDiff % 10) : 3;
+                        SIM::SendSimpleMessage(ATNET_BOTSELECT, 0, c, Sim.Players.Players[c].BotLevel);
+                    }
+                }
+                PlayerReadyAt = max(PlayerReadyAt, now + 1500);
+                CheckNames();
+            } else if (PlayerReadyAt <= now) {
+                NetTestClick(18, 15); // Los! -> ATNET_BEGINGAME
+            }
+        }
+        break;
+
+    default:
+        break;
+    }
 }

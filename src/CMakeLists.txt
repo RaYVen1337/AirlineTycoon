@@ -171,7 +171,9 @@ endif()
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CMAKE_BUILD_TYPE Debug)
     add_compile_definitions(_DEBUG)
-    target_compile_options(common INTERFACE "-Wno-unused-variable")
+    if(NOT MSVC)
+        target_compile_options(common INTERFACE "-Wno-unused-variable")
+    endif()
 elseif (CMAKE_BUILD_TYPE STREQUAL "Release")
     set(CMAKE_BUILD_TYPE Release)
     add_compile_definitions(NDEBUG)
@@ -207,6 +209,15 @@ if (WIN32)
         "${CMAKE_BINARY_DIR}/dependencies"
         "$<TARGET_FILE_DIR:AT>"
         COMMENT "Copying dependencies to $<TARGET_FILE_DIR:AT>"
+    )
+endif()
+
+if (MSVC AND AT_ASAN)
+    # ASan runtime next to the exe (also needed by the /update-patched-files-only post build step)
+    add_custom_command(
+        TARGET AT PRE_LINK
+        COMMENT "Copying ASan runtime DLLs"
+        COMMAND ${CMAKE_COMMAND} -DSRC_DIR=${AT_ASAN_BIN_DIR} -DDST_DIR=$<TARGET_FILE_DIR:AT> -P "${CMAKE_MODULE_PATH}/copy_asan_runtime.cmake"
     )
 endif()
 

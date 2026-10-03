@@ -291,11 +291,22 @@ class TEAKFILE {
     void WriteLine(char *);
     void Announce(SLONG);
 
+    // True if this file is backed by a memory buffer (network messages etc.) instead of an SDL file
+    bool IsMemRead() const;
+    // Number of unread bytes of a memory-backed file, or -1 for file-backed ones (unknown/unchecked)
+    SLONG GetMemRemaining() const;
+    // Sanity check for element counts / sizes read from the stream before allocating anything.
+    // Sets the ReadError flag and returns false if the count is negative, absurd or can't possibly fit in the remaining memory buffer
+    bool CheckReadCount(SLONG count, SLONG minBytesPerElement = 1);
+    // Sticky flag: set if a memory read ran past the end of the buffer or a size prefix was implausible
+    bool HasReadError() const { return ReadError; }
+
     SDL_RWops *Ctx;
     char *Path;
     BUFFER<UBYTE> MemBuffer;
     SLONG MemPointer;
     ULONG MemBufferUsed;
+    bool ReadError{false};
 
 #if 0
     friend TEAKFILE &operator<<(TEAKFILE &File, const BOOL &b) {
@@ -421,7 +432,11 @@ class TEAKFILE {
     friend TEAKFILE &operator>>(TEAKFILE &File, CString &b) {
         ULONG size;
         File >> size;
-        BUFFER_V<BYTE> str(size);
+        if (!File.CheckReadCount(static_cast<SLONG>(size))) {
+            b = "";
+            return File;
+        }
+        BUFFER_V<BYTE> str(static_cast<SLONG>(size) + 1); // zero initialized, so always null terminated
         File.Read(str.getData(), size);
         b = (PCSTR)(BYTE *)str.getData();
         return File;
@@ -440,7 +455,11 @@ class TEAKFILE {
         // File.ReadTrap(4242);
         ULONG size;
         File >> size;
-        BUFFER_V<BYTE> str(size+1);
+        if (!File.CheckReadCount(static_cast<SLONG>(size))) {
+            b.clear();
+            return File;
+        }
+        BUFFER_V<BYTE> str(static_cast<SLONG>(size) + 1);
         File.Read(str.getData(), size);
         str[size] = '\0';
         b = (PCSTR)(BYTE *)str.getData();
@@ -475,6 +494,13 @@ class TEAKFILE {
     template <typename T> friend TEAKFILE &operator>>(TEAKFILE &File, BUFFER_V<T> &buffer) {
         SLONG size, offset;
         File >> size >> offset;
+        if (!File.CheckReadCount(size)) {
+            return File;
+        }
+        if (offset < 0 || offset > size) {
+            File.ReadError = true;
+            offset = 0;
+        }
         buffer.ReSize(size);
         buffer.incIter(offset);
         for (SLONG i = 0; i < buffer.AnzEntries(); i++) {
@@ -495,9 +521,16 @@ class TEAKFILE {
     template <typename T> friend TEAKFILE &operator>>(TEAKFILE &File, BUFFER<T> &buffer) {
         SLONG size, offset;
         File >> size;
+        if (!File.CheckReadCount(size)) {
+            return File;
+        }
         buffer.ReSize(0);
         buffer.ReSize(size);
         File >> offset;
+        if (offset < 0 || offset > size) {
+            File.ReadError = true;
+            offset = 0;
+        }
         for (SLONG i = 0; i < buffer.Size; i++) {
             File >> buffer.MemPointer[i];
         }
@@ -1371,6 +1404,9 @@ template <typename T> class ALBUM_V {
         SLONG size, filler;
         File >> size;
         File >> filler;
+        if (!File.CheckReadCount(size)) {
+            return File;
+        }
         buffer.ReSize(size);
         for (SLONG i = 0; i < size; i++) {
             File >> buffer.List[i].first;
@@ -1380,6 +1416,10 @@ template <typename T> class ALBUM_V {
 
         File >> size;
         File >> filler;
+        if (!File.CheckReadCount(size)) {
+            buffer.rebuild_hash_table();
+            return File;
+        }
         buffer.ReSize(size);
 #ifdef DEBUG_ALBUM
         assert(buffer.AnzEntries() == size);
@@ -1388,6 +1428,9 @@ template <typename T> class ALBUM_V {
             File >> buffer.List[i].second;
         }
 
+        // free-slot search hints are not part of the stream; ReSize() only reset IdxBack
+        buffer.IdxFront = 0;
+        buffer.IdxBack = buffer.AnzEntries() - 1;
         buffer.rebuild_hash_table();
         return File;
     }

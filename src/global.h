@@ -172,6 +172,16 @@ extern BOOL bFirstClass;
 extern SLONG gAutoQuitOnDay; // Exit game on specified game
 extern SLONG gAutoBotDiff;
 
+// Multiplayer repro harness (/nettest host|client), see Takeoff.cpp CLI
+extern SLONG gNetTestMode;   // 0 = off, 1 = host, 2 = client
+extern CString gNetTestIP;   // client: host address
+extern SLONG gNetTestPort;   // informational only: RakNet port is fixed (SERVER_PORT)
+extern SLONG gNetTestDays;   // quit with exit code 0 after this many game days
+extern SLONG gNetTestSpeed;  // GameSpeed of the local player (5 = max)
+extern SLONG gNetTestFuzz;   // nettest: replay every received game message this many times with random damage
+extern SLONG gNetTestTurbo;  // nettest: simulation runs this many times faster than the normal max speed
+extern SLONG gNetTestMonkey; // != 0: random room visits and mouse input of the local player, value = seed
+
 //--------------------------------------------------------------------------------------------
 // Das Spiel höchstpersönlich:
 //--------------------------------------------------------------------------------------------

@@ -238,9 +238,11 @@ bool ENetNetwork::Receive(UBYTE **buffer, ULONG &length) {
         return false;
 
     ENetPacket *packet = mPackets.GetLastAccessed();
-    length = packet->dataLength;
-    *buffer = new UBYTE[length];
-    memcpy(*buffer, packet->data, length);
+    length = packet->data != nullptr ? static_cast<ULONG>(packet->dataLength) : 0;
+    *buffer = new UBYTE[length + 1](); // zero-initialised, so a short message never exposes stale heap memory
+    if (length > 0) {
+        memcpy(*buffer, packet->data, length);
+    }
 
     /* Clean up the packet now that we're done using it. */
     enet_packet_destroy(packet);

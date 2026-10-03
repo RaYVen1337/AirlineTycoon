@@ -2564,6 +2564,13 @@ TEAKFILE &operator>>(TEAKFILE &File, CXPlane &p) {
     char Dummy[8192];
 
     File >> dwSize >> lCost >> lWeight >> lConsumption >> lNoise >> lReliability >> lSpeed;
+
+    // dwSize may come from the network or a damaged file: Don't underflow and don't overflow Dummy
+    if (dwSize < sizeof(DWORD) + sizeof(SLONG) * 5 || dwSize - (sizeof(DWORD) + sizeof(SLONG) * 5) + 1 > sizeof(Dummy)) {
+        File.ReadError = true;
+        return (File);
+    }
+
     dwSize -= sizeof(DWORD) + sizeof(SLONG) * 5;
     File.Read(reinterpret_cast<UBYTE *>(Dummy), dwSize + 1);
 

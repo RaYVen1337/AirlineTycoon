@@ -335,6 +335,21 @@ void PLAYER::NetUpdateFreightOrder(const CFracht &auftrag) const {
 // Updates the rental data of one route and back:
 //--------------------------------------------------------------------------------------------
 void PLAYER::NetUpdateRentRoute(SLONG Route1Id, SLONG Route2Id) {
+    // The receiver expects indices into Routen / RentRouten. Convert album ids and refuse anything out of range:
+    for (SLONG *pId : {&Route1Id, &Route2Id}) {
+        if (*pId >= 0x1000000) {
+            if (Routen.IsInAlbum(static_cast<ULONG>(*pId)) == 0) {
+                AT_Log("NetUpdateRentRoute: unknown route id %lx", static_cast<unsigned long>(*pId));
+                return;
+            }
+            *pId = Routen(static_cast<ULONG>(*pId));
+        }
+        if (*pId < 0 || *pId >= Routen.AnzEntries() || *pId >= RentRouten.RentRouten.AnzEntries()) {
+            AT_Log("NetUpdateRentRoute: route index %li out of range", static_cast<long>(*pId));
+            return;
+        }
+    }
+
     TEAKFILE Message;
 
     Message.Announce(128);

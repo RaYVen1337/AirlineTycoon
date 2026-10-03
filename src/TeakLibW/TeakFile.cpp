@@ -73,16 +73,58 @@ void TEAKFILE::Open(char const *path, SLONG mode) {
 
 SLONG TEAKFILE::IsOpen() const { return static_cast<SLONG>(Ctx != nullptr); }
 
+bool TEAKFILE::IsMemRead() const { return MemBuffer.AnzEntries() > 0 || Ctx == nullptr; }
+
+SLONG TEAKFILE::GetMemRemaining() const {
+    if (!IsMemRead()) {
+        return -1;
+    }
+
+    ULONG used = MemBufferUsed;
+    if (used > static_cast<ULONG>(MemBuffer.AnzEntries())) {
+        used = static_cast<ULONG>(MemBuffer.AnzEntries());
+    }
+    if (MemPointer < 0 || static_cast<ULONG>(MemPointer) >= used) {
+        return 0;
+    }
+    return static_cast<SLONG>(used - static_cast<ULONG>(MemPointer));
+}
+
+bool TEAKFILE::CheckReadCount(SLONG count, SLONG minBytesPerElement) {
+    if (count < 0 || count > 0x10000000) {
+        ReadError = true;
+        return false;
+    }
+
+    SLONG remaining = GetMemRemaining();
+    if (remaining >= 0 && static_cast<long long>(count) * minBytesPerElement > remaining) {
+        ReadError = true;
+        return false;
+    }
+    return true;
+}
+
 void TEAKFILE::Read(unsigned char *buffer, SLONG size) {
-    if (MemBuffer.AnzEntries() > 0) {
-        SLONG anz = 0;
-        if (size >= MemBufferUsed - MemPointer) {
-            anz = MemBufferUsed - MemPointer;
-        } else {
-            anz = size;
+    if (IsMemRead()) {
+        if (size <= 0) {
+            if (size < 0) {
+                ReadError = true;
+            }
+            return;
         }
-        memcpy(buffer, MemPointer + MemBuffer, anz);
-        MemPointer += size;
+
+        // Never read past the end of the memory buffer, hand out zeroes for the missing part and remember the error:
+        SLONG remaining = GetMemRemaining();
+        SLONG anz = (size < remaining) ? size : remaining;
+
+        if (anz > 0) {
+            memcpy(buffer, MemPointer + MemBuffer, anz);
+            MemPointer += anz;
+        }
+        if (anz < size) {
+            memset(buffer + anz, 0, size - anz);
+            ReadError = true;
+        }
     } else {
         if (SDL_RWread(Ctx, buffer, 1, size) != size) {
             TeakLibW_Exception(nullptr, 0, ExcRead, Path);

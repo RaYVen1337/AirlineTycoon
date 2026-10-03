@@ -82,6 +82,10 @@ void CRouten::ReInit(const CString &TabFilename, bool bNoDoublettes) {
 
     SLONG routes = CountLines(FileData, FileP) * 2; // 2x for "to" and "back"
 
+    // Route ids are handed out by a running counter. Restart it, so that every (re-)initialisation produces the same ids on
+    // all machines, no matter how often ReInit() already ran before (host and clients must agree on the ids):
+    ResetNextId();
+
     ReSize(0);
     ReSize(routes);
 

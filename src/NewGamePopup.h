@@ -84,6 +84,9 @@ class NewGamePopup : public CStdRaum {
 
     bool bThisIsSessionMaster{};
 
+    ULONG NetTestNextAt{};
+    SLONG NetTestSetupDone{};
+
     SBStr NetworkConnection;
     static SBStr NetworkSession;
 
@@ -95,6 +98,8 @@ class NewGamePopup : public CStdRaum {
     void Konstruktor(BOOL bHandy, SLONG PlayerNum);
     void RefreshKlackerField(void);
     void CheckNames(void);
+    void NetTestStep();              // /nettest harness: drives the menus automatically
+    void NetTestClick(SLONG Column, SLONG Line);
     static void PushNames(void);
     static void PushName(SLONG n);
 

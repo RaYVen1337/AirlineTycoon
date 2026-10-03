@@ -11,14 +11,103 @@
 #include "network.h"
 #include "Proto.h"
 #include "SbLib.h"
+#include <algorithm>
+#include <random>
 
 #include <cmath>
+#include <exception>
+#include <vector>
 
 #define AT_Log(...) AT_Log_I("AtNet", __VA_ARGS__)
 
 extern SBNetwork gNetwork;
 
 #define GFX_MENU (0x00000000554e454d)
+
+//--------------------------------------------------------------------------------------------
+// Validation of values received from the network. A corrupt or malicious message must never
+// crash the game: log it and drop the message instead.
+//--------------------------------------------------------------------------------------------
+static inline bool isValidPlayerNum(SLONG PlayerNum) { return PlayerNum >= 0 && PlayerNum < 4 && PlayerNum < Sim.Players.Players.AnzEntries(); }
+
+// Number of player blocks inside of the multi-player sync messages
+static inline bool isValidPlayerCount(SLONG Anz) { return Anz >= 0 && Anz <= 4; }
+
+// True, if the id (or index) can be handed to operator[] / operator() of the album without throwing.
+// Mirrors the lookup logic of ALBUM_V::find():
+template <typename T> static inline bool isValidAlbumRef(const T &Album, SLONG IdOrIndex) {
+    if (IdOrIndex < 0) {
+        return false;
+    }
+    if (static_cast<ULONG>(IdOrIndex) >= 0x1000000) {
+        return Album.IsInAlbum(static_cast<ULONG>(IdOrIndex)) != 0;
+    }
+    return IdOrIndex < Album.AnzEntries();
+}
+
+// Resolves a route id or a route index received from the network to a valid index into Routen / RentRouten:
+static bool resolveRouteIndex(PLAYER &qPlayer, SLONG RouteIdOrIndex, SLONG &RouteIndex) {
+    if (!isValidAlbumRef(Routen, RouteIdOrIndex)) {
+        return false;
+    }
+
+    RouteIndex = Routen(static_cast<ULONG>(RouteIdOrIndex));
+    return RouteIndex >= 0 && RouteIndex < Routen.AnzEntries() && RouteIndex < qPlayer.RentRouten.RentRouten.AnzEntries();
+}
+
+// Returns the person that represents a player on the airport, or nullptr if there is none:
+static PERSON *getPlayerPerson(SLONG PlayerNum) {
+    ULONG Index = Sim.Persons.GetPlayerIndex(PlayerNum);
+
+    if (Index == 0xffffffffU || Sim.Persons.IsInAlbum(Index) == 0) {
+        return nullptr;
+    }
+    return &Sim.Persons[Index];
+}
+
+// The victim of a sabotage: a player or -1 (none, see SIM::NewDay)
+static bool isValidVictim(SLONG Opfer) { return Opfer == -1 || isValidPlayerNum(Opfer); }
+
+// A cell of the airport floor (Airport.iPlate), as used for the walking targets of the players.
+// The walking code also touches the neighbour cells (x +-2), so the outermost cells are not accepted.
+static bool isValidPlateXY(XY Cell) {
+    return Cell.x >= 2 && Cell.x < Airport.PlateDimension.x - 2 && Cell.y >= 0 && Cell.y < Airport.PlateDimension.y && Cell.y < 16;
+}
+
+// A pixel position of a person in the airport, converted to a cell like PLAYER::UpdateWaypointWalkingDirection does:
+static bool isValidAirportPos(XY Pos) {
+    if (Pos.x < -4400 || Pos.x > 1000000 || Pos.y < -2200 || Pos.y > 1000000) {
+        return false; // keeps the conversion below free of overflows
+    }
+    XY Cell;
+    Cell.x = (Pos.x + 4400) / 44 - 100;
+    if (Pos.y > 0 && Pos.y < 5000) {
+        Cell.y = (Pos.y + 2200) / 22 - 100 + 5;
+    } else {
+        Cell.y = (Pos.y - 5000 + 2200) / 22 - 100;
+    }
+    return isValidPlateXY(Cell);
+}
+
+static void LogBadNetMessage(ULONG MessageType, const char *What, SLONG Value) {
+    AT_Log("Dropping network message 0x%lx: invalid %s (%li)", static_cast<unsigned long>(MessageType), What, static_cast<long>(Value));
+}
+
+// Leaves the current case of the message switch (or the current while loop of a multi-player block) if the condition is not met:
+#define NET_CHECK(cond, what, value)                                                                                                                           \
+    if (!(cond)) {                                                                                                                                             \
+        LogBadNetMessage(MessageType, what, static_cast<SLONG>(value));                                                                                        \
+        break;                                                                                                                                                 \
+    }
+
+#define NET_CHECK_PLAYER(PlayerNum) NET_CHECK(isValidPlayerNum(PlayerNum), "PlayerNum", PlayerNum)
+
+// The message ended too early or contained an implausible size prefix:
+#define NET_CHECK_READ()                                                                                                                                       \
+    if (Message.HasReadError()) {                                                                                                                              \
+        AT_Log("Dropping network message 0x%lx: message too short or invalid size prefix", static_cast<unsigned long>(MessageType));                           \
+        break;                                                                                                                                                 \
+    }
 
 SLONG nPlayerOptionsOpen[4] = {0, 0, 0, 0};  // Fummelt gerade wer an den Options?
 SLONG nPlayerAppsDisabled[4] = {0, 0, 0, 0}; // Ist ein anderer Spieler gerade in einer anderen Anwendung?
@@ -206,6 +295,156 @@ void PumpBroadcastBitmap(bool bJustForEmergency) {
 }
 
 //--------------------------------------------------------------------------------------------
+// /nettestfuzz N: every received game message is additionally replayed N times with random
+// damage (bit flips, cut off, bytes inserted/removed = shifted data, garbage tail). The game
+// must survive all of them. Only messages that carry game data are used; session control
+// (pause, sync points, load/save, dialogs, ...) is left alone so the test keeps running.
+//--------------------------------------------------------------------------------------------
+static std::vector<std::vector<UBYTE>> gNetFuzzQueue;
+
+static bool NetFuzzIsDataMessage(ULONG MessageType) {
+    switch (MessageType) {
+    case ATNET_SETSPEED:
+    case ATNET_ENTERROOM:
+    case ATNET_LEAVEROOM:
+    case ATNET_PLAYERPOS:
+    case ATNET_PLAYERLOOK:
+    case ATNET_PLAYERSTOP:
+    case ATNET_ROBOT_EXECUTE:
+    case ATNET_SYNC_MONEY:
+    case ATNET_SYNC_IMAGE:
+    case ATNET_SYNC_ROUTES:
+    case ATNET_SYNC_FLAGS:
+    case ATNET_SYNC_ITEMS:
+    case ATNET_SYNC_PLANES:
+    case ATNET_SYNC_OFFICEFLAG:
+    case ATNET_SYNC_MEETING:
+    case ATNET_SYNCROUTECHANGE:
+    case ATNET_SYNCGEHALT:
+    case ATNET_SYNCKEROSIN:
+    case ATNET_SYNCNUMFLUEGE:
+    case ATNET_TAKE_ORDER:
+    case ATNET_TAKE_FREIGHT:
+    case ATNET_TAKE_ROUTE:
+    case ATNET_TAKE_CITY:
+    case ATNET_TAKETHING:
+    case ATNET_PLAYER_TOOK:
+    case ATNET_PLAYER_REFILL:
+    case ATNET_BUY_NEW:
+    case ATNET_BUY_NEWX:
+    case ATNET_BUY_USED:
+    case ATNET_SELL_USED:
+    case ATNET_PERSONNEL:
+    case ATNET_PLANEPROPS:
+    case ATNET_FP_UPDATE:
+    case ATNET_CHANGEMONEY:
+    case ATNET_ADD_EXPLOSION:
+    case ATNET_ADD_SYMPATHIE:
+    case ATNET_SABOTAGE_ARAB:
+    case ATNET_SABOTAGE_DIRECT:
+    case ATNET_GIMMICK:
+    case ATNET_BODYGUARD:
+    case ATNET_CAFFEINE:
+    case ATNET_ADVISOR:
+    case ATNET_OVERTAKE:
+    case ATNET_EXPAND_AIRPORT:
+    case ATNET_CHATBROADCAST:
+    case ATNET_CHATMESSAGE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void NetFuzzCapture(const UBYTE *pData, ULONG Size) {
+    static std::mt19937 Rng(static_cast<unsigned>(gNetTestFuzz * 7919 + gNetTestMode));
+    static SLONG Count = 0;
+
+    if (gNetTestFuzz == 0 || pData == nullptr || Size < 4 || Sim.Gamestate != (GAMESTATE_PLAYING | GAMESTATE_WORKING) || Sim.Time < 9 * 60000 || Sim.Time > 18 * 60000) {
+        return;
+    }
+    const ULONG MessageType = pData[0] | (pData[1] << 8) | (pData[2] << 16) | (ULONG(pData[3]) << 24);
+    if (!NetFuzzIsDataMessage(MessageType)) {
+        return;
+    }
+
+    // N > 0: damage the frame as it travels over the wire (message + checksum trailer), so the checksum has to catch it.
+    // N < 0: damage the bare message after the checksum test: tests the message handlers themselves.
+    const bool bWire = gNetTestFuzz > 0;
+    const SLONG Times = std::abs(gNetTestFuzz);
+    std::vector<UBYTE> Frame(pData, pData + Size);
+    if (bWire) {
+        const ULONG Trailer[2] = {0x4B435441, NetChecksum(pData, Size)};
+        Frame.insert(Frame.end(), reinterpret_cast<const UBYTE *>(Trailer), reinterpret_cast<const UBYTE *>(Trailer) + sizeof(Trailer));
+        Size = static_cast<ULONG>(Frame.size());
+    }
+
+    for (SLONG n = 0; n < Times; n++) {
+        std::vector<UBYTE> v(Frame);
+        const ULONG Body = static_cast<ULONG>(v.size()) - 4; // the message type stays intact
+        switch (Rng() % 4) {
+        case 0: // flip some bytes
+            for (SLONG c = 1 + static_cast<SLONG>(Rng() % 8); c > 0 && Body > 0; c--) {
+                v[4 + Rng() % Body] ^= static_cast<UBYTE>(1 + Rng() % 255);
+            }
+            break;
+        case 1: // cut off
+            v.resize(4 + (Body > 0 ? Rng() % Body : 0));
+            break;
+        case 2: // insert or remove 1..7 bytes: everything behind is shifted, like in issue #29
+        {
+            const ULONG Pos = 4 + (Body > 0 ? Rng() % Body : 0);
+            const ULONG Len = 1 + Rng() % 7;
+            if ((Rng() & 1) != 0) {
+                v.insert(v.begin() + Pos, Len, static_cast<UBYTE>(Rng()));
+                v.resize(Size); // same length as before, like a valid frame
+            } else {
+                v.erase(v.begin() + Pos, v.begin() + std::min<ULONG>(Pos + Len, static_cast<ULONG>(v.size())));
+            }
+        } break;
+        default: // garbage tail
+            for (ULONG c = 4 + (Body > 0 ? Rng() % Body : 0); c < v.size(); c++) {
+                v[c] = static_cast<UBYTE>(Rng());
+            }
+            break;
+        }
+        if (v == Frame) {
+            continue; // two flips of the same byte can cancel each other out
+        }
+        if (bWire) {
+            ULONG WireSize = static_cast<ULONG>(v.size());
+            if (!NetCheckAndStripChecksum(v.data(), WireSize)) {
+                continue; // dropped, as it should be
+            }
+            AT_Log("NETTEST fuzz: damaged message passed the checksum test");
+            v.resize(WireSize);
+        }
+        gNetFuzzQueue.push_back(std::move(v));
+    }
+
+    if (((Count += Times) % 5000) < Times) {
+        AT_Log("NETTEST fuzz: %ld damaged messages so far", Count);
+    }
+}
+
+static bool NetFuzzNext(TEAKFILE &Message) {
+    if (gNetFuzzQueue.empty()) {
+        return false;
+    }
+    std::vector<UBYTE> v = std::move(gNetFuzzQueue.back());
+    gNetFuzzQueue.pop_back();
+
+    Message.Close();
+    Message.MemBuffer.ReSize(0);
+    auto *p = new UBYTE[v.size()];
+    memcpy(p, v.data(), v.size());
+    Message.MemBuffer.ReSize(static_cast<SLONG>(v.size()), p);
+    Message.MemBufferUsed = static_cast<ULONG>(v.size());
+    Message.MemPointer = 0;
+    return true;
+}
+
+//--------------------------------------------------------------------------------------------
 // Look for new messages:
 //--------------------------------------------------------------------------------------------
 void PumpNetwork() {
@@ -226,10 +465,10 @@ void PumpNetwork() {
     }
 
     bool bReturnAfterThisMessage = false;
-    while ((gNetwork.GetMessageCount() != 0) && !bReturnAfterThisMessage) {
+    while ((gNetwork.GetMessageCount() != 0 || !gNetFuzzQueue.empty()) && !bReturnAfterThisMessage) {
         TEAKFILE Message;
 
-        if (SIM::ReceiveMemFile(Message)) {
+        if (NetFuzzNext(Message) || (SIM::ReceiveMemFile(Message) && (NetFuzzCapture(Message.MemBuffer, Message.MemBufferUsed), true))) {
             ULONG MessageType = 0;
             SLONG Par1 = 0;
             SLONG Par2 = 0;
@@ -237,9 +476,12 @@ void PumpNetwork() {
             Message >> MessageType;
             // AT_Log_I("Net", "Received net event: %s", Translate_ATNET(MessageType));
 
+            // Lookups in albums throw if they are given an id that does not exist. A bad message must not take the whole game down:
+            try {
             switch (MessageType) {
             case ATNET_SETSPEED:
                 Message >> Par1 >> Par2;
+                NET_CHECK_PLAYER(Par1);
                 Sim.Players.Players[Par1].GameSpeed = Par2;
                 if (Sim.Players.Players[Sim.localPlayer].LocationWin != nullptr) {
                     (Sim.Players.Players[Sim.localPlayer].LocationWin)->StatusCount = 3;
@@ -258,11 +500,13 @@ void PumpNetwork() {
 
             case ATNET_READYFORMORNING:
                 Message >> Par1;
+                NET_CHECK_PLAYER(Par1);
                 Sim.Players.Players[Par1].bReadyForMorning = 1;
                 break;
 
             case ATNET_READYFORBRIEFING:
                 Message >> Par1;
+                NET_CHECK_PLAYER(Par1);
                 Sim.Players.Players[Par1].bReadyForBriefing = 1;
                 break;
 
@@ -364,6 +608,7 @@ void PumpNetwork() {
 
             case ATNET_OPTIONS:
                 Message >> Par1 >> Par2;
+                NET_CHECK(Par2 >= 0 && Par2 < 4, "PlayerNum", Par2);
                 nOptionsOpen += Par1;
                 nPlayerOptionsOpen[Par2] += Par1;
                 SetNetworkBitmap(static_cast<SLONG>(nOptionsOpen > 0) * 1);
@@ -371,6 +616,7 @@ void PumpNetwork() {
 
             case ATNET_ACTIVATEAPP:
                 Message >> Par1 >> Par2;
+                NET_CHECK(Par2 >= 0 && Par2 < 4, "PlayerNum", Par2);
                 nAppsDisabled += Par1;
                 nOptionsOpen += Par1;
                 nPlayerOptionsOpen[Par2] += Par1;
@@ -401,23 +647,58 @@ void PumpNetwork() {
 
                 Message >> PlayerNum;
                 // if (Sim.Players.Players[PlayerNum].Owner!=1) hprintf ("Received Message ATNET_PLAYERPOS (%li)", PlayerNum);
+                NET_CHECK_PLAYER(PlayerNum);
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
-                PERSON &qPerson = Sim.Persons[Sim.Persons.GetPlayerIndex(PlayerNum)];
+                PERSON *pPerson = getPlayerPerson(PlayerNum);
+                NET_CHECK(pPerson != nullptr, "PlayerNum (no person)", PlayerNum);
+                PERSON &qPerson = *pPerson;
 
                 // Read the message data:
-                Message >> qPlayer.PrimaryTarget.x >> qPlayer.PrimaryTarget.y;
-                Message >> qPlayer.SecondaryTarget.x >> qPlayer.SecondaryTarget.y;
-                Message >> qPlayer.TertiaryTarget.x >> qPlayer.TertiaryTarget.y;
-                Message >> qPlayer.DirectToRoom >> qPlayer.iWalkActive;
-                Message >> qPlayer.TopLocation >> qPlayer.ExRoom;
-                Message >> qPlayer.NewDir >> qPlayer.WalkSpeed;
-                Message >> qPerson.Target.x >> qPerson.Target.y;
-                Message >> qPerson.Position.x >> qPerson.Position.y;
-                Message >> qPerson.ScreenPos.x >> qPerson.ScreenPos.y;
-                Message >> qPerson.StatePar >> qPerson.Running;
-                Message >> qPerson.Dir >> qPerson.LookDir;
-                Message >> qPerson.Phase;
+                XY PrimaryTarget, SecondaryTarget, TertiaryTarget, Target, Position, ScreenPos;
+                SLONG DirectToRoom = 0, ExRoom = 0, WalkSpeed = 0, StatePar = 0;
+                BOOL iWalkActive = FALSE;
+                UWORD TopLocation = 0;
+                UBYTE NewDir = 0, Running = 0, Dir = 0, LookDir = 0, Phase = 0;
+                Message >> PrimaryTarget.x >> PrimaryTarget.y;
+                Message >> SecondaryTarget.x >> SecondaryTarget.y;
+                Message >> TertiaryTarget.x >> TertiaryTarget.y;
+                Message >> DirectToRoom >> iWalkActive;
+                Message >> TopLocation >> ExRoom;
+                Message >> NewDir >> WalkSpeed;
+                Message >> Target.x >> Target.y;
+                Message >> Position.x >> Position.y;
+                Message >> ScreenPos.x >> ScreenPos.y;
+                Message >> StatePar >> Running;
+                Message >> Dir >> LookDir;
+                Message >> Phase;
+
+                if (Message.HasReadError()) {
+                    AT_Log("Dropping rest of network message 0x%lx: message too short", static_cast<unsigned long>(MessageType));
+                    break;
+                }
+                // Positions and directions are used as array indices when the player walks:
+                NET_CHECK(isValidAirportPos(Position) && isValidAirportPos(Target), "Position", Position.x);
+                NET_CHECK(isValidPlateXY(PrimaryTarget) && isValidPlateXY(SecondaryTarget) && isValidPlateXY(TertiaryTarget), "Target", PrimaryTarget.x);
+                NET_CHECK(NewDir <= 8 && Dir <= 8 && LookDir <= 9 && WalkSpeed >= 0 && WalkSpeed <= 100, "Dir", Dir);
+
+                qPlayer.PrimaryTarget = PrimaryTarget;
+                qPlayer.SecondaryTarget = SecondaryTarget;
+                qPlayer.TertiaryTarget = TertiaryTarget;
+                qPlayer.DirectToRoom = DirectToRoom;
+                qPlayer.iWalkActive = iWalkActive;
+                qPlayer.TopLocation = TopLocation;
+                qPlayer.ExRoom = ExRoom;
+                qPlayer.NewDir = NewDir;
+                qPlayer.WalkSpeed = WalkSpeed;
+                qPerson.Target = Target;
+                qPerson.Position = Position;
+                qPerson.ScreenPos = ScreenPos;
+                qPerson.StatePar = StatePar;
+                qPerson.Running = Running;
+                qPerson.Dir = Dir;
+                qPerson.LookDir = LookDir;
+                qPerson.Phase = Phase;
 
                 qPlayer.UpdateWaypointWalkingDirection();
 
@@ -435,6 +716,11 @@ void PumpNetwork() {
                 // Message time is different from local time. Adapt data:
                 Message >> MessageTime;
                 LocalTime = Sim.TimeSlice;
+
+                // No catching up with garbage: a damaged time stamp would replay billions of steps and freeze the game
+                if (Message.HasReadError() || MessageTime > LocalTime || MessageTime < LocalTime - 5000) {
+                    MessageTime = LocalTime;
+                }
 
                 Sim.TimeSlice = MessageTime;
                 /*hprintf ("Diff=%li", LocalTime-Sim.TimeSlice);*/
@@ -454,6 +740,7 @@ void PumpNetwork() {
                 SLONG PlayerNum = 0;
 
                 Message >> PlayerNum;
+                NET_CHECK_PLAYER(PlayerNum);
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
 
@@ -473,6 +760,7 @@ void PumpNetwork() {
                 SLONG PlayerNum = 0;
 
                 Message >> PlayerNum;
+                NET_CHECK_PLAYER(PlayerNum);
 
                 Message >> Sim.Players.Players[PlayerNum].Koffein;
             } break;
@@ -482,8 +770,11 @@ void PumpNetwork() {
                 SLONG Mode = 0;
 
                 Message >> PlayerNum >> Mode;
+                NET_CHECK_PLAYER(PlayerNum);
 
-                PERSON &qPerson = Sim.Persons[static_cast<SLONG>(Sim.Persons.GetPlayerIndex(PlayerNum))];
+                PERSON *pPerson = getPlayerPerson(PlayerNum);
+                NET_CHECK(pPerson != nullptr, "PlayerNum (no person)", PlayerNum);
+                PERSON &qPerson = *pPerson;
 
                 if (Mode == 1) {
                     qPerson.State = qPerson.State & ~PERSON_WAITFLAG;
@@ -506,14 +797,18 @@ void PumpNetwork() {
                 SLONG Dir = 0;
 
                 Message >> PlayerNum >> Dir;
+                NET_CHECK_PLAYER(PlayerNum);
 
-                Sim.Persons[static_cast<SLONG>(Sim.Persons.GetPlayerIndex(PlayerNum))].LookAt(Dir);
+                PERSON *pPerson = getPlayerPerson(PlayerNum);
+                NET_CHECK(pPerson != nullptr, "PlayerNum (no person)", PlayerNum);
+                pPerson->LookAt(Dir);
             } break;
 
             case ATNET_PLAYERSTOP: {
                 SLONG PlayerNum = 0;
 
                 Message >> PlayerNum;
+                NET_CHECK_PLAYER(PlayerNum);
 
                 Sim.Players.Players[PlayerNum].WalkStopEx();
             } break;
@@ -523,10 +818,12 @@ void PumpNetwork() {
                 SLONG RoomEntered = 0;
 
                 Message >> PlayerNum;
+                NET_CHECK_PLAYER(PlayerNum);
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
 
                 Message >> qPlayer.DirectToRoom >> RoomEntered;
+                NET_CHECK(RoomEntered == -1 || (RoomEntered >= 0 && RoomEntered < Sim.RoomBusy.AnzEntries()), "RoomEntered", RoomEntered);
 
                 if (RoomEntered != -1) {
                     CTalker *pTalker = nullptr;
@@ -606,10 +903,12 @@ void PumpNetwork() {
                 SLONG RoomLeft = 0;
 
                 Message >> PlayerNum;
+                NET_CHECK_PLAYER(PlayerNum);
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
 
                 Message >> qPlayer.DirectToRoom >> RoomLeft;
+                NET_CHECK(RoomLeft == -1 || (RoomLeft >= 0 && RoomLeft < Sim.RoomBusy.AnzEntries()), "RoomLeft", RoomLeft);
 
                 if (RoomLeft != -1) {
                     switch (RoomLeft) {
@@ -662,6 +961,7 @@ void PumpNetwork() {
                 SLONG Cheat = 0;
 
                 Message >> PlayerNum >> Cheat;
+                NET_CHECK_PLAYER(PlayerNum);
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
 
@@ -681,31 +981,68 @@ void PumpNetwork() {
             } break;
 
             case ATNET_SYNC_IMAGE: {
+                // The data is read into temporaries first and only applied if the whole message was valid:
+                struct SyncedImage {
+                    SLONG PlayerNum{};
+                    decltype(PLAYER::Image) Image{};
+                    decltype(PLAYER::ImageGotWorse) ImageGotWorse{};
+                    SLONG Sympathie[4]{};
+                    std::vector<UBYTE> RouteImage;
+                    std::vector<UBYTE> CityImage;
+                };
+
                 SLONG Anz = 0;
-                SLONG PlayerNum = 0;
 
                 Message >> Anz;
+                NET_CHECK(isValidPlayerCount(Anz), "Anz", Anz);
 
-                while (Anz > 0) {
-                    Message >> PlayerNum;
+                std::vector<SyncedImage> Data(Anz);
+                bool bValid = true;
 
-                    PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
-                    SLONG d = 0;
-
-                    Message >> qPlayer.Image >> qPlayer.ImageGotWorse;
-
-                    for (d = 0; d < 4; d++) {
-                        Message >> qPlayer.Sympathie[d];
+                for (auto &Entry : Data) {
+                    Message >> Entry.PlayerNum;
+                    if (!isValidPlayerNum(Entry.PlayerNum)) {
+                        LogBadNetMessage(MessageType, "PlayerNum", Entry.PlayerNum);
+                        bValid = false;
+                        break;
                     }
 
-                    for (d = Routen.AnzEntries() - 1; d >= 0; d--) {
-                        Message >> qPlayer.RentRouten.RentRouten[d].Image;
-                    }
-                    for (d = Cities.AnzEntries() - 1; d >= 0; d--) {
-                        Message >> qPlayer.RentCities.RentCities[d].Image;
+                    Message >> Entry.Image >> Entry.ImageGotWorse;
+
+                    for (SLONG d = 0; d < 4; d++) {
+                        Message >> Entry.Sympathie[d];
                     }
 
-                    Anz--;
+                    Entry.RouteImage.resize(Routen.AnzEntries());
+                    for (SLONG d = Routen.AnzEntries() - 1; d >= 0; d--) {
+                        Message >> Entry.RouteImage[d];
+                    }
+                    Entry.CityImage.resize(Cities.AnzEntries());
+                    for (SLONG d = Cities.AnzEntries() - 1; d >= 0; d--) {
+                        Message >> Entry.CityImage[d];
+                    }
+                }
+
+                if (!bValid) {
+                    break;
+                }
+                NET_CHECK_READ();
+
+                for (auto &Entry : Data) {
+                    PLAYER &qPlayer = Sim.Players.Players[Entry.PlayerNum];
+
+                    qPlayer.Image = Entry.Image;
+                    qPlayer.ImageGotWorse = Entry.ImageGotWorse;
+
+                    for (SLONG d = 0; d < 4 && d < qPlayer.Sympathie.AnzEntries(); d++) {
+                        qPlayer.Sympathie[d] = Entry.Sympathie[d];
+                    }
+                    for (SLONG d = 0; d < SLONG(Entry.RouteImage.size()) && d < qPlayer.RentRouten.RentRouten.AnzEntries(); d++) {
+                        qPlayer.RentRouten.RentRouten[d].Image = Entry.RouteImage[d];
+                    }
+                    for (SLONG d = 0; d < SLONG(Entry.CityImage.size()) && d < qPlayer.RentCities.RentCities.AnzEntries(); d++) {
+                        qPlayer.RentCities.RentCities[d].Image = Entry.CityImage[d];
+                    }
                 }
             } break;
 
@@ -714,9 +1051,11 @@ void PumpNetwork() {
                 SLONG PlayerNum = 0;
 
                 Message >> Anz;
+                NET_CHECK(isValidPlayerCount(Anz), "Anz", Anz);
 
                 while (Anz > 0) {
                     Message >> PlayerNum;
+                    NET_CHECK_PLAYER(PlayerNum);
 
                     PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
                     SLONG d = 0;
@@ -731,30 +1070,76 @@ void PumpNetwork() {
                         Message >> qPlayer.Kurse[d];
                     }
 
+                    NET_CHECK_READ();
+
                     Anz--;
                 }
             } break;
 
             case ATNET_SYNC_ROUTES: {
+                // The data is read into temporaries first and only applied if the whole message was valid:
+                struct SyncedRoutes {
+                    SLONG PlayerNum{};
+                    std::vector<CRentRoute> Routes;
+                };
+
                 SLONG Anz = 0;
-                SLONG PlayerNum = 0;
 
                 Message >> Anz;
+                NET_CHECK(isValidPlayerCount(Anz), "Anz", Anz);
 
-                while (Anz > 0) {
-                    Message >> PlayerNum;
+                std::vector<SyncedRoutes> Data(Anz);
+                bool bValid = true;
 
-                    PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
-                    SLONG d = 0;
-
-                    for (d = Routen.AnzEntries() - 1; d >= 0; d--) {
-                        Message >> qPlayer.RentRouten.RentRouten[d].Rang >> qPlayer.RentRouten.RentRouten[d].LastFlown >>
-                            qPlayer.RentRouten.RentRouten[d].Image >> qPlayer.RentRouten.RentRouten[d].Miete >> qPlayer.RentRouten.RentRouten[d].Ticketpreis >>
-                            qPlayer.RentRouten.RentRouten[d].TicketpreisFC >> qPlayer.RentRouten.RentRouten[d].TageMitVerlust >>
-                            qPlayer.RentRouten.RentRouten[d].TageMitGering;
+                for (auto &Entry : Data) {
+                    Message >> Entry.PlayerNum;
+                    if (!isValidPlayerNum(Entry.PlayerNum)) {
+                        LogBadNetMessage(MessageType, "PlayerNum", Entry.PlayerNum);
+                        bValid = false;
+                        break;
                     }
 
-                    Anz--;
+                    Entry.Routes.resize(Routen.AnzEntries());
+                    for (SLONG d = Routen.AnzEntries() - 1; d >= 0; d--) {
+                        CRentRoute &qRoute = Entry.Routes[d];
+
+                        Message >> qRoute.Rang >> qRoute.LastFlown >> qRoute.Image >> qRoute.Miete >> qRoute.Ticketpreis >> qRoute.TicketpreisFC >>
+                            qRoute.TageMitVerlust >> qRoute.TageMitGering;
+                    }
+
+                    if (Message.HasReadError()) {
+                        break;
+                    }
+                }
+
+                if (!bValid) {
+                    break;
+                }
+                NET_CHECK_READ();
+
+                for (auto &Entry : Data) {
+                    PLAYER &qPlayer = Sim.Players.Players[Entry.PlayerNum];
+
+                    if (qPlayer.RentRouten.RentRouten.AnzEntries() < SLONG(Entry.Routes.size())) {
+                        AT_Log("Dropping data of network message 0x%lx for player %li: RentRouten has the wrong size (%li vs. %li)",
+                               static_cast<unsigned long>(MessageType), static_cast<long>(Entry.PlayerNum), static_cast<long>(qPlayer.RentRouten.RentRouten.AnzEntries()),
+                               static_cast<long>(Entry.Routes.size()));
+                        continue;
+                    }
+
+                    for (SLONG d = SLONG(Entry.Routes.size()) - 1; d >= 0; d--) {
+                        CRentRoute &qRoute = qPlayer.RentRouten.RentRouten[d];
+                        const CRentRoute &qNew = Entry.Routes[d];
+
+                        qRoute.Rang = qNew.Rang;
+                        qRoute.LastFlown = qNew.LastFlown;
+                        qRoute.Image = qNew.Image;
+                        qRoute.Miete = qNew.Miete;
+                        qRoute.Ticketpreis = qNew.Ticketpreis;
+                        qRoute.TicketpreisFC = qNew.TicketpreisFC;
+                        qRoute.TageMitVerlust = qNew.TageMitVerlust;
+                        qRoute.TageMitGering = qNew.TageMitGering;
+                    }
                 }
             } break;
 
@@ -763,15 +1148,19 @@ void PumpNetwork() {
                 SLONG PlayerNum = 0;
 
                 Message >> Anz;
+                NET_CHECK(isValidPlayerCount(Anz), "Anz", Anz);
 
                 while (Anz > 0) {
                     Message >> PlayerNum;
+                    NET_CHECK_PLAYER(PlayerNum);
 
                     PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
 
                     Message >> qPlayer.SickTokay >> qPlayer.RunningToToilet >> qPlayer.PlayerSmoking >> qPlayer.Stunned >> qPlayer.OfficeState >>
                         qPlayer.Koffein >> qPlayer.NumFlights >> qPlayer.WalkSpeed >> qPlayer.WerbeBroschuere >> qPlayer.TelephoneDown >>
                         qPlayer.Presseerklaerung >> qPlayer.SecurityFlags >> qPlayer.PlayerStinking >> qPlayer.RocketFlags >> qPlayer.LastRocketFlags;
+
+                    NET_CHECK_READ();
 
                     Anz--;
                 }
@@ -785,6 +1174,8 @@ void PumpNetwork() {
                 if (PlayerNum == 55) {
                     Message >> Sim.nSecOutDays;
                 } else {
+                    NET_CHECK_PLAYER(PlayerNum);
+
                     PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
 
                     Message >> qPlayer.OfficeState;
@@ -796,15 +1187,24 @@ void PumpNetwork() {
                 SLONG PlayerNum = 0;
 
                 Message >> Anz;
+                NET_CHECK(isValidPlayerCount(Anz), "Anz", Anz);
 
                 while (Anz > 0) {
                     Message >> PlayerNum;
+                    NET_CHECK_PLAYER(PlayerNum);
 
                     PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
 
                     for (SLONG c = 0; c < 6; c++) {
-                        Message >> qPlayer.Items[c];
+                        UBYTE Item = 0;
+
+                        Message >> Item;
+                        if (c < qPlayer.Items.AnzEntries()) {
+                            qPlayer.Items[c] = Item;
+                        }
                     }
+
+                    NET_CHECK_READ();
 
                     Anz--;
                 }
@@ -815,13 +1215,17 @@ void PumpNetwork() {
                 SLONG PlayerNum = 0;
 
                 Message >> Anz;
+                NET_CHECK(isValidPlayerCount(Anz), "Anz", Anz);
 
                 while (Anz > 0) {
                     Message >> PlayerNum;
+                    NET_CHECK_PLAYER(PlayerNum);
 
                     PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
 
                     Message >> qPlayer.Planes >> qPlayer.Auftraege >> qPlayer.Frachten >> qPlayer.RentCities;
+
+                    NET_CHECK_READ();
 
                     Anz--;
                 }
@@ -832,17 +1236,49 @@ void PumpNetwork() {
                 SLONG PlayerNum = 0;
 
                 Message >> Anz;
+                NET_CHECK(isValidPlayerCount(Anz), "Anz", Anz);
+
+                bool bValid = true;
 
                 while (Anz > 0) {
                     Message >> PlayerNum;
+                    if (!isValidPlayerNum(PlayerNum)) {
+                        LogBadNetMessage(MessageType, "PlayerNum", PlayerNum);
+                        bValid = false;
+                        break;
+                    }
 
                     PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
 
-                    Message >> qPlayer.ArabTrust >> qPlayer.ArabMode >> qPlayer.ArabMode2 >> qPlayer.ArabMode3 >> qPlayer.ArabActive;
-                    Message >> qPlayer.ArabOpfer >> qPlayer.ArabOpfer2 >> qPlayer.ArabOpfer3 >> qPlayer.ArabPlane >> qPlayer.ArabHints;
-                    Message >> qPlayer.ArabTimeout >> qPlayer.NumPassengers >> qPlayer.NumFracht;
+                    SLONG Trust = 0, Mode = 0, Mode2 = 0, Mode3 = 0, Active = 0, Opfer = 0, Opfer2 = 0, Opfer3 = 0, Plane = 0, Hints = 0, Timeout = 0;
+                    Message >> Trust >> Mode >> Mode2 >> Mode3 >> Active;
+                    Message >> Opfer >> Opfer2 >> Opfer3 >> Plane >> Hints;
+                    Message >> Timeout >> qPlayer.NumPassengers >> qPlayer.NumFracht;
+
+                    // The victims are used as player index when the sabotage is executed:
+                    if (Message.HasReadError() || !isValidVictim(Opfer) || !isValidVictim(Opfer2) || !isValidVictim(Opfer3)) {
+                        bValid = false;
+                        break;
+                    }
+
+                    qPlayer.ArabTrust = Trust;
+                    qPlayer.ArabMode = Mode;
+                    qPlayer.ArabMode2 = Mode2;
+                    qPlayer.ArabMode3 = Mode3;
+                    qPlayer.ArabActive = Active;
+                    qPlayer.ArabOpfer = Opfer;
+                    qPlayer.ArabOpfer2 = Opfer2;
+                    qPlayer.ArabOpfer3 = Opfer3;
+                    qPlayer.ArabPlane = Plane;
+                    qPlayer.ArabHints = Hints;
+                    qPlayer.ArabTimeout = Timeout;
 
                     Anz--;
+                }
+
+                if (!bValid) {
+                    AT_Log("Dropping rest of network message 0x%lx: invalid player data or message too short", static_cast<unsigned long>(MessageType));
+                    break;
                 }
 
                 BOOL SentFromHost = 0;
@@ -859,8 +1295,11 @@ void PumpNetwork() {
                 SLONG SympathieTarget = 0;
 
                 Message >> PlayerNum >> SympathieTarget >> Anz;
+                NET_CHECK_PLAYER(PlayerNum);
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
+
+                NET_CHECK(SympathieTarget >= 0 && SympathieTarget < qPlayer.Sympathie.AnzEntries(), "SympathieTarget", SympathieTarget);
 
                 qPlayer.Sympathie[SympathieTarget] += Anz;
                 Limit(static_cast<SLONG>(-1000), qPlayer.Sympathie[SympathieTarget], static_cast<SLONG>(1000));
@@ -873,13 +1312,22 @@ void PumpNetwork() {
                 SLONG TicketpreisFC = 0;
 
                 Message >> PlayerNum >> RouteId >> Ticketpreis >> TicketpreisFC;
+                NET_CHECK_PLAYER(PlayerNum);
+                NET_CHECK_READ();
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
-                if (qPlayer.RentRouten.RentRouten[Routen(RouteId)].Ticketpreis != Ticketpreis) {
-                    DebugBreak();
+                SLONG RouteIndex = 0;
+
+                NET_CHECK(resolveRouteIndex(qPlayer, RouteId, RouteIndex), "RouteId", RouteId);
+
+                // A difference here means that the clients are out of sync. Report it, but never crash because of it:
+                if (qPlayer.RentRouten.RentRouten[RouteIndex].Ticketpreis != Ticketpreis) {
+                    AT_Log("SYNCROUTECHANGE: Ticketpreis differs for player %li, route %li (local %li vs. %li)", static_cast<long>(PlayerNum),
+                           static_cast<long>(RouteId), static_cast<long>(qPlayer.RentRouten.RentRouten[RouteIndex].Ticketpreis), static_cast<long>(Ticketpreis));
                 }
-                if (qPlayer.RentRouten.RentRouten[Routen(RouteId)].TicketpreisFC != TicketpreisFC) {
-                    DebugBreak();
+                if (qPlayer.RentRouten.RentRouten[RouteIndex].TicketpreisFC != TicketpreisFC) {
+                    AT_Log("SYNCROUTECHANGE: TicketpreisFC differs for player %li, route %li (local %li vs. %li)", static_cast<long>(PlayerNum),
+                           static_cast<long>(RouteId), static_cast<long>(qPlayer.RentRouten.RentRouten[RouteIndex].TicketpreisFC), static_cast<long>(TicketpreisFC));
                 }
 
                 qPlayer.UpdateTicketpreise(RouteId, Ticketpreis, TicketpreisFC);
@@ -893,8 +1341,11 @@ void PumpNetwork() {
                 SLONG PlayerNum = 0;
 
                 Message >> PlayerNum;
+                NET_CHECK_PLAYER(PlayerNum);
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
+
+                NET_CHECK(qPlayer.Sympathie.AnzEntries() >= 4, "Sympathie size", qPlayer.Sympathie.AnzEntries());
 
                 Message >> qPlayer.WaitWorkTill >> qPlayer.WaitWorkTill2;
 
@@ -931,16 +1382,24 @@ void PumpNetwork() {
                     gFrachten.Refill();
                     break;
                 case 4:
+                    if (City < 0 || City >= SLONG(AuslandsRefill.size()) || City >= SLONG(AuslandsAuftraege.size())) {
+                        LogBadNetMessage(MessageType, "City", City);
+                        break;
+                    }
                     AuslandsRefill[City] = Delta;
                     AuslandsAuftraege[City].RefillForAusland(City);
                     break;
                 case 5:
+                    if (City < 0 || City >= SLONG(AuslandsFRefill.size()) || City >= SLONG(AuslandsFrachten.size())) {
+                        LogBadNetMessage(MessageType, "City", City);
+                        break;
+                    }
                     AuslandsFRefill[City] = Delta;
                     AuslandsFrachten[City].RefillForAusland(City);
                     break;
                 default:
-                    hprintf("AtNet.cpp: Default case should not be reached.");
-                    DebugBreak();
+                    LogBadNetMessage(MessageType, "Type", Type);
+                    break;
                 }
             } break;
 
@@ -951,26 +1410,47 @@ void PumpNetwork() {
                 SLONG PlayerNum = 0;
 
                 Message >> PlayerNum >> Type >> Index >> City;
+                NET_CHECK_PLAYER(PlayerNum);
 
                 switch (Type) {
                 case 1:
+                    if (!isValidAlbumRef(LastMinuteAuftraege, Index)) {
+                        LogBadNetMessage(MessageType, "Index", Index);
+                        break;
+                    }
                     LastMinuteAuftraege[Index].Praemie = -1;
                     break;
                 case 2:
+                    if (!isValidAlbumRef(ReisebueroAuftraege, Index)) {
+                        LogBadNetMessage(MessageType, "Index", Index);
+                        break;
+                    }
                     ReisebueroAuftraege[Index].Praemie = -1;
                     break;
                 case 3:
+                    if (!isValidAlbumRef(gFrachten, Index)) {
+                        LogBadNetMessage(MessageType, "Index", Index);
+                        break;
+                    }
                     gFrachten[Index].Praemie = -1;
                     break;
                 case 4:
+                    if (City < 0 || City >= SLONG(AuslandsAuftraege.size()) || !isValidAlbumRef(AuslandsAuftraege[City], Index)) {
+                        LogBadNetMessage(MessageType, "City/Index", City);
+                        break;
+                    }
                     AuslandsAuftraege[City][Index].Praemie = -1;
                     break;
                 case 5:
+                    if (City < 0 || City >= SLONG(AuslandsFrachten.size()) || !isValidAlbumRef(AuslandsFrachten[City], Index)) {
+                        LogBadNetMessage(MessageType, "City/Index", City);
+                        break;
+                    }
                     AuslandsFrachten[City][Index].Praemie = -1;
                     break;
                 default:
-                    hprintf("AtNet.cpp: Default case should not be reached.");
-                    DebugBreak();
+                    LogBadNetMessage(MessageType, "Type", Type);
+                    break;
                 }
             } break;
 
@@ -991,15 +1471,18 @@ void PumpNetwork() {
                 SLONG PlayerNum = 0;
 
                 Message >> PlaneId >> PlayerNum;
+                NET_CHECK_PLAYER(PlayerNum);
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
                 if (qPlayer.Planes.IsInAlbum(PlaneId) == 0) {
                     hprintf("Plane not in Album: %li, %li", PlayerNum, PlaneId);
+                    break;
                 }
 
                 CPlane &qPlane = qPlayer.Planes[PlaneId];
 
                 Message >> qPlane.Flugplan;
+                NET_CHECK_READ();
 
                 // Daten aktualisieren
                 qPlane.Flugplan.UpdateNextFlight();
@@ -1009,6 +1492,12 @@ void PumpNetwork() {
                 CFlugplan &qPlan = qPlane.Flugplan;
 
                 for (e = qPlan.Flug.AnzEntries() - 1; e >= 0; e--) {
+                    if (qPlan.Flug[e].ObjectType == 1) {
+                        if (!isValidAlbumRef(Routen, qPlan.Flug[e].ObjectId)) {
+                            hprintf("Err: Flight %li, Route %lx", qPlan.Flug[e].ObjectType, qPlan.Flug[e].ObjectId);
+                            qPlan.Flug[e].ObjectType = 0;
+                        }
+                    }
                     if (qPlan.Flug[e].ObjectType == 2) {
                         if (qPlayer.Auftraege.IsInAlbum(qPlan.Flug[e].ObjectId) == 0) {
                             hprintf("Err: Flight %li, %lx", qPlan.Flug[e].ObjectType, qPlan.Flug[e].ObjectId);
@@ -1044,6 +1533,9 @@ void PumpNetwork() {
                 CAuftrag a;
 
                 Message >> PlayerNum >> a;
+                NET_CHECK_PLAYER(PlayerNum);
+                NET_CHECK_READ();
+                NET_CHECK(isValidAlbumRef(Cities, SLONG(a.VonCity)) && isValidAlbumRef(Cities, SLONG(a.NachCity)), "city", a.VonCity);
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
 
@@ -1059,6 +1551,9 @@ void PumpNetwork() {
                 CFracht a;
 
                 Message >> PlayerNum >> a;
+                NET_CHECK_PLAYER(PlayerNum);
+                NET_CHECK_READ();
+                NET_CHECK(isValidAlbumRef(Cities, SLONG(a.VonCity)) && isValidAlbumRef(Cities, SLONG(a.NachCity)), "city", a.VonCity);
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
 
@@ -1070,23 +1565,65 @@ void PumpNetwork() {
             } break;
 
             case ATNET_TAKE_CITY: {
+                // "Player" is the highest bidder (-1 = nobody) and is used as a player index later on:
+                SLONG CityPlayer[7];
+                SLONG CityPreis[7];
+                SLONG GatePlayer[7];
+                SLONG GatePreis[7];
+                bool bValid = true;
+
                 for (SLONG c = 0; c < 7; c++) {
-                    Message >> TafelData.City[c].Player >> TafelData.City[c].Preis;
-                    Message >> TafelData.Gate[c].Player >> TafelData.Gate[c].Preis;
+                    Message >> CityPlayer[c] >> CityPreis[c];
+                    Message >> GatePlayer[c] >> GatePreis[c];
+
+                    if (CityPlayer[c] < -1 || CityPlayer[c] > 3) {
+                        LogBadNetMessage(MessageType, "City.Player", CityPlayer[c]);
+                        bValid = false;
+                    }
+                    if (GatePlayer[c] < -1 || GatePlayer[c] > 3) {
+                        LogBadNetMessage(MessageType, "Gate.Player", GatePlayer[c]);
+                        bValid = false;
+                    }
+                }
+
+                if (!bValid) {
+                    break;
+                }
+                NET_CHECK_READ();
+
+                for (SLONG c = 0; c < 7; c++) {
+                    TafelData.City[c].Player = CityPlayer[c];
+                    TafelData.City[c].Preis = CityPreis[c];
+                    TafelData.Gate[c].Player = GatePlayer[c];
+                    TafelData.Gate[c].Preis = GatePreis[c];
                 }
             } break;
 
             case ATNET_TAKE_ROUTE: {
+                // Route1Id and Route2Id are indices into Routen / RentRouten (see PLAYER::NetUpdateRentRoute), but album ids are accepted as well:
                 SLONG PlayerNum = 0;
                 SLONG Route1Id = 0;
                 SLONG Route2Id = 0;
 
                 Message >> PlayerNum >> Route1Id >> Route2Id;
+                NET_CHECK_PLAYER(PlayerNum);
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
+                SLONG Route1Index = 0;
+                SLONG Route2Index = 0;
 
-                Message >> qPlayer.RentRouten.RentRouten[Route1Id];
-                Message >> qPlayer.RentRouten.RentRouten[Route2Id];
+                NET_CHECK(resolveRouteIndex(qPlayer, Route1Id, Route1Index), "Route1Id", Route1Id);
+                NET_CHECK(resolveRouteIndex(qPlayer, Route2Id, Route2Index), "Route2Id", Route2Id);
+
+                CRentRoute Route1 = qPlayer.RentRouten.RentRouten[Route1Index];
+                CRentRoute Route2 = qPlayer.RentRouten.RentRouten[Route2Index];
+
+                Message >> Route1;
+                Message >> Route2;
+                NET_CHECK_READ();
+
+                qPlayer.RentRouten.RentRouten[Route1Index] = Route1;
+                qPlayer.RentRouten.RentRouten[Route2Index] = Route2;
             } break;
 
             case ATNET_ADVISOR: {
@@ -1097,12 +1634,18 @@ void PumpNetwork() {
                 TEAKRAND rnd;
 
                 Message >> Art >> From >> Generic1;
+                NET_CHECK_PLAYER(From);
+                NET_CHECK(isValidPlayerNum(Sim.localPlayer), "localPlayer", Sim.localPlayer);
 
                 PLAYER &qFromPlayer = Sim.Players.Players[From];
 
                 switch (Art) {
                 // Tafel: Jemand hat einen überboten
                 case 0:
+                    if (Generic1 < 0 || Generic1 >= SLONG(TafelData.ByPositions.size()) || TafelData.ByPositions[Generic1] == nullptr) {
+                        LogBadNetMessage(MessageType, "Generic1", Generic1);
+                        break;
+                    }
                     if (qPlayer.HasBerater(BERATERTYP_INFO) >= rnd.Rand(100)) {
                         auto &qEntry = *TafelData.ByPositions[Generic1];
                         if (qEntry.Type == CTafelZettel::Type::GATE) {
@@ -1117,6 +1660,10 @@ void PumpNetwork() {
 
                     // Jemand kauft gebrauchtes Flugzeug:
                 case 1:
+                    if (Generic1 < 0 || Generic1 >= Sim.UsedPlanes.AnzEntries() || Sim.UsedPlanes.IsInAlbum(Generic1) == 0) {
+                        LogBadNetMessage(MessageType, "Generic1", Generic1);
+                        break;
+                    }
                     if (qPlayer.HasBerater(BERATERTYP_INFO) >= rnd.Rand(100)) {
                         qPlayer.Messages.AddMessage(BERATERTYP_INFO, bprintf(StandardTexte.GetS(TOKEN_ADVICE, 9000), (LPCTSTR)qFromPlayer.NameX,
                                                                              (LPCTSTR)qFromPlayer.AirlineX, Sim.UsedPlanes[Generic1].CalculatePrice()));
@@ -1139,8 +1686,8 @@ void PumpNetwork() {
                     }
                     break;
                 default:
-                    hprintf("AtNet.cpp: Default case should not be reached.");
-                    DebugBreak();
+                    LogBadNetMessage(MessageType, "Art", Art);
+                    break;
                 }
             } break;
 
@@ -1150,6 +1697,8 @@ void PumpNetwork() {
                 SLONG Time = 0;
 
                 Message >> PlayerNum >> PlaneIndex >> Time;
+                NET_CHECK_PLAYER(PlayerNum);
+                NET_CHECK(PlaneIndex >= 0 && PlaneIndex < Sim.UsedPlanes.AnzEntries() && Sim.UsedPlanes.IsInAlbum(PlaneIndex) != 0, "PlaneIndex", PlaneIndex);
 
                 PLAYER &qFromPlayer = Sim.Players.Players[PlayerNum];
 
@@ -1168,8 +1717,11 @@ void PumpNetwork() {
                 SLONG PlaneId = 0;
 
                 Message >> PlayerNum >> PlaneId;
+                NET_CHECK_PLAYER(PlayerNum);
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
+
+                NET_CHECK(qPlayer.Planes.IsInAlbum(PlaneId) != 0, "PlaneId", PlaneId);
 
                 qPlayer.Planes -= PlaneId;
             } break;
@@ -1181,6 +1733,9 @@ void PumpNetwork() {
                 TEAKRAND rnd;
 
                 Message >> PlayerNum >> Anzahl >> Type;
+                NET_CHECK_PLAYER(PlayerNum);
+                NET_CHECK(Anzahl >= 0 && Anzahl <= 100, "Anzahl", Anzahl);
+                NET_CHECK(Type >= 0 && Type < PlaneTypes.AnzEntries() && PlaneTypes.IsInAlbum(Type) != 0, "Type", Type);
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
 
@@ -1198,6 +1753,9 @@ void PumpNetwork() {
                 TEAKRAND rnd;
 
                 Message >> PlayerNum >> Anzahl >> plane;
+                NET_CHECK_PLAYER(PlayerNum);
+                NET_CHECK_READ();
+                NET_CHECK(Anzahl >= 0 && Anzahl <= 100, "Anzahl", Anzahl);
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
 
@@ -1225,7 +1783,7 @@ void PumpNetwork() {
                     while (true) {
                         Message >> c;
 
-                        if (c == -1) {
+                        if (c == -1 || Message.HasReadError()) {
                             break;
                         }
                         if (qPlayer.Planes.IsInAlbum(c) != 0) {
@@ -1246,9 +1804,7 @@ void PumpNetwork() {
                 SLONG PlaneId = 0;
 
                 Message >> PlayerNum >> PlaneId;
-                if (PlayerNum > 4) {
-                    break;
-                }
+                NET_CHECK_PLAYER(PlayerNum);
                 Message >> Sim.Players.Players[PlayerNum].MechMode;
 
                 if (PlaneId != -1 && (Sim.Players.Players[PlayerNum].Planes.IsInAlbum(PlaneId) != 0)) {
@@ -1275,12 +1831,15 @@ void PumpNetwork() {
                 // Ist Spieler bereit, einen Dialog zu beginnen?
                 if (qPlayer.GetRoom() == ROOM_AIRPORT && (qPlayer.IsStuck == 0) && (pRaum != nullptr) && pRaum->MenuIsOpen() == FALSE &&
                     pRaum->IsDialogOpen() == FALSE) {
-                    PERSON &qPerson = Sim.Persons[static_cast<SLONG>(Sim.Persons.GetPlayerIndex(Sim.localPlayer))];
+                    PERSON *pPerson = getPlayerPerson(Sim.localPlayer);
+                    NET_CHECK(pPerson != nullptr, "localPlayer (no person)", Sim.localPlayer);
+                    PERSON &qPerson = *pPerson;
 
                     qPlayer.WalkStopEx();
                     qPlayer.IsTalking = TRUE;
 
                     Message >> qPerson.Phase >> RequestingPlayer >> qPerson.Position.x >> qPerson.Position.y;
+                    NET_CHECK_PLAYER(RequestingPlayer);
 
                     qPerson.Dir = 8;
                     qPerson.LookDir = 8;
@@ -1292,6 +1851,7 @@ void PumpNetwork() {
                     XY Dummy2;
 
                     Message >> Dummy >> RequestingPlayer >> Dummy2.x >> Dummy2.y;
+                    NET_CHECK_PLAYER(RequestingPlayer);
 
                     // Nein! Keine Interviews!
                     SIM::SendSimpleMessage(ATNET_DIALOG_NO, Sim.Players.Players[RequestingPlayer].NetworkID);
@@ -1304,8 +1864,11 @@ void PumpNetwork() {
                 SLONG Phase = 0;
 
                 Message >> TargetPlayer >> Phase;
+                NET_CHECK_PLAYER(TargetPlayer);
 
-                Sim.Persons[static_cast<SLONG>(Sim.Persons.GetPlayerIndex(TargetPlayer))].Phase = UBYTE(Phase);
+                PERSON *pPerson = getPlayerPerson(TargetPlayer);
+                NET_CHECK(pPerson != nullptr, "TargetPlayer (no person)", TargetPlayer);
+                pPerson->Phase = UBYTE(Phase);
 
                 if (!qPlayer.bDialogStartSent) {
                     qPlayer.IsWalking2Player = TargetPlayer;
@@ -1319,12 +1882,15 @@ void PumpNetwork() {
                 auto *pRaum = qPlayer.LocationWin;
 
                 Message >> OtherPlayerNum;
+                NET_CHECK_PLAYER(OtherPlayerNum);
 
                 // Erneute Abfrage: Ist Spieler bereit, einen Dialog zu beginnen?
                 if (qPlayer.GetRoom() == ROOM_AIRPORT && (qPlayer.IsStuck == 0) && (pRaum != nullptr) && pRaum->MenuIsOpen() == FALSE &&
                     pRaum->IsDialogOpen() == FALSE) {
                     // JA!
-                    PERSON &qPerson = Sim.Persons[Sim.Persons.GetPlayerIndex(OtherPlayerNum)];
+                    PERSON *pPerson = getPlayerPerson(OtherPlayerNum);
+                    NET_CHECK(pPerson != nullptr, "OtherPlayerNum (no person)", OtherPlayerNum);
+                    PERSON &qPerson = *pPerson;
 
                     Message >> qPerson.Position.x >> qPerson.Position.y >> qPerson.Phase >> qPerson.LookDir;
 
@@ -1405,6 +1971,7 @@ void PumpNetwork() {
                 SLONG PlayerNum = 0;
 
                 Message >> PlayerNum;
+                NET_CHECK_PLAYER(PlayerNum);
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
                 qPlayer.IsTalking = TRUE;
@@ -1414,6 +1981,7 @@ void PumpNetwork() {
                 SLONG PlayerNum = 0;
 
                 Message >> PlayerNum;
+                NET_CHECK_PLAYER(PlayerNum);
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
                 qPlayer.IsTalking = FALSE;
@@ -1438,6 +2006,7 @@ void PumpNetwork() {
                 SLONG PlayerNum = 0;
 
                 Message >> PlayerNum;
+                NET_CHECK_PLAYER(PlayerNum);
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
 
@@ -1449,6 +2018,8 @@ void PumpNetwork() {
                 SLONG Item = 0;
 
                 Message >> PlayerNum >> Item;
+                NET_CHECK_PLAYER(PlayerNum);
+                NET_CHECK(Item >= 0 && Item < 256, "Item", Item);
 
                 Sim.Players.Players[PlayerNum].DropItem(UBYTE(Item));
             } break;
@@ -1462,6 +2033,7 @@ void PumpNetwork() {
                 SLONG bHandy = 0;
 
                 Message >> OtherPlayerNum >> bHandy;
+                NET_CHECK_PLAYER(OtherPlayerNum);
 
                 if (qPlayer.LocationWin != nullptr) {
                     CStdRaum &qRoom = *(qPlayer.LocationWin);
@@ -1505,6 +2077,7 @@ void PumpNetwork() {
                 SLONG bHandy = 0;
 
                 Message >> OtherPlayerNum >> bHandy;
+                NET_CHECK_PLAYER(OtherPlayerNum);
 
                 if (qPlayer.LocationWin != nullptr) {
                     (qPlayer.LocationWin)->StartDialog(TALKER_COMPETITOR, MEDIUM_HANDY, OtherPlayerNum, 0);
@@ -1580,6 +2153,7 @@ void PumpNetwork() {
                 PLAYER &qPlayer = Sim.Players.Players[Sim.localPlayer];
 
                 Message >> Money >> OtherPlayer;
+                NET_CHECK_PLAYER(OtherPlayer);
 
                 Sim.Players.Players[Sim.localPlayer].ChangeMoney(Money, 3700, Sim.Players.Players[OtherPlayer].NameX);
                 Sim.Players.Players[OtherPlayer].ChangeMoney(-Money, 3701, Sim.Players.Players[Sim.localPlayer].NameX);
@@ -1622,15 +2196,30 @@ void PumpNetwork() {
                 SLONG PlayerNum = 0;
 
                 Message >> PlayerNum;
+                NET_CHECK_PLAYER(PlayerNum);
 
                 PLAYER &qPlayer = Sim.Players.Players[PlayerNum];
 
-                Message >> qPlayer.ArabOpfer >> qPlayer.ArabMode >> qPlayer.ArabActive >> qPlayer.ArabPlane >> qPlayer.ArabOpfer2 >> qPlayer.ArabMode2 >>
-                    qPlayer.ArabOpfer3 >> qPlayer.ArabMode3 >> qPlayer.ArabTimeout;
+                SLONG Opfer = 0, Mode = 0, Active = 0, Plane = 0, Opfer2 = 0, Mode2 = 0, Opfer3 = 0, Mode3 = 0, Timeout = 0;
+                Message >> Opfer >> Mode >> Active >> Plane >> Opfer2 >> Mode2 >> Opfer3 >> Mode3 >> Timeout;
+                NET_CHECK_READ();
+                // The victims are used as player index when the sabotage is executed:
+                NET_CHECK(isValidVictim(Opfer) && isValidVictim(Opfer2) && isValidVictim(Opfer3), "ArabOpfer", Opfer);
+
+                qPlayer.ArabOpfer = Opfer;
+                qPlayer.ArabMode = Mode;
+                qPlayer.ArabActive = Active;
+                qPlayer.ArabPlane = Plane;
+                qPlayer.ArabOpfer2 = Opfer2;
+                qPlayer.ArabMode2 = Mode2;
+                qPlayer.ArabOpfer3 = Opfer3;
+                qPlayer.ArabMode3 = Mode3;
+                qPlayer.ArabTimeout = Timeout;
             } break;
 
             case ATNET_WAITFORPLAYER:
                 Message >> Par1 >> Par2;
+                NET_CHECK(Par2 >= 0 && Par2 < 4, "PlayerNum", Par2);
                 nWaitingForPlayer += Par1;
                 nPlayerWaiting[Par2] += Par1;
                 if (nPlayerWaiting[Par2] < 0) {
@@ -1684,6 +2273,7 @@ void PumpNetwork() {
                 SLONG FromPlayer = 0;
 
                 Message >> FromPlayer;
+                NET_CHECK_PLAYER(FromPlayer);
 
                 Sim.Players.Players[FromPlayer].CallItADay = TRUE;
             } break;
@@ -1692,6 +2282,7 @@ void PumpNetwork() {
                     SLONG FromPlayer = 0;
 
                     Message >> FromPlayer;
+                    NET_CHECK_PLAYER(FromPlayer);
 
                     Sim.Players.Players[FromPlayer].CallItADay = FALSE;
                 }
@@ -1746,6 +2337,8 @@ void PumpNetwork() {
                 DWORD UniqueGameId = 0;
 
                 Message >> FromPlayer >> Index >> UniqueGameId;
+                NET_CHECK_PLAYER(FromPlayer);
+                NET_CHECK(Index >= 0 && Index < 100, "savegame Index", Index);
 
                 if (Sim.GetSavegameUniqueGameId(Index, true) == UniqueGameId) {
                     SIM::SendSimpleMessage(ATNET_IO_LOADREQUEST_OK, Sim.Players.Players[FromPlayer].NetworkID, Sim.localPlayer, Index);
@@ -1764,6 +2357,8 @@ void PumpNetwork() {
                 SLONG Index = 0;
 
                 Message >> FromPlayer >> Index;
+                NET_CHECK_PLAYER(FromPlayer);
+                NET_CHECK(Index >= 0 && Index < 100, "savegame Index", Index);
 
                 Sim.Players.Players[FromPlayer].bReadyForBriefing = 1;
 
@@ -1799,6 +2394,7 @@ void PumpNetwork() {
                 SLONG Index = 0;
 
                 Message >> Index;
+                NET_CHECK(Index >= 0 && Index < 100, "savegame Index", Index);
 
                 Sim.LoadGame(Index);
             } break;
@@ -1863,6 +2459,7 @@ void PumpNetwork() {
                 SLONG localPlayer = 0;
 
                 Message >> localPlayer;
+                NET_CHECK(localPlayer >= 0 && localPlayer < 4, "PlayerNum", localPlayer);
                 Message >> GenericSyncIds[localPlayer];
 
                 bReturnAfterThisMessage = true;
@@ -1872,6 +2469,7 @@ void PumpNetwork() {
                 SLONG localPlayer = 0;
 
                 Message >> localPlayer;
+                NET_CHECK(localPlayer >= 0 && localPlayer < 4, "PlayerNum", localPlayer);
                 Message >> GenericSyncIds[localPlayer] >> GenericSyncIdPars[localPlayer];
 
                 bReturnAfterThisMessage = true;
@@ -1884,6 +2482,7 @@ void PumpNetwork() {
 
                 Message >> player;
                 Message >> SyncId >> Par;
+                NET_CHECK(player >= 0 && player < 4, "PlayerNum", player);
 
                 bReturnAfterThisMessage = true;
 
@@ -1898,6 +2497,7 @@ void PumpNetwork() {
                 SLONG delta = 0;
 
                 Message >> localPlayer >> delta;
+                NET_CHECK_PLAYER(localPlayer);
 
                 if (localPlayer != Sim.localPlayer) {
                     Sim.Players.Players[localPlayer].ChangeMoney(delta, 3130, "");
@@ -1913,6 +2513,8 @@ void PumpNetwork() {
 
                 SLONG playerId = static_cast<SLONG>(Par1);
                 SLONG statistikid = static_cast<SLONG>(Par3);
+                NET_CHECK(Par1 >= 0 && Par1 < 4, "PlayerNum", static_cast<SLONG>(Par1));
+                NET_CHECK_PLAYER(playerId);
 
                 Sim.Players.Players[playerId].ChangeMoney(Par2, statistikid, "");
             } break;
@@ -1927,6 +2529,7 @@ void PumpNetwork() {
                 DOUBLE TankPreis = NAN;
 
                 Message >> playerId >> Tank >> TankOpen >> TankInhalt >> KerosinQuali >> KerosinKind >> TankPreis;
+                NET_CHECK_PLAYER(playerId);
 
                 if (playerId != Sim.localPlayer) {
                     PLAYER &qPlayer = Sim.Players.Players[playerId];
@@ -1945,6 +2548,7 @@ void PumpNetwork() {
                 SLONG gehalt = 0;
 
                 Message >> playerId >> gehalt;
+                NET_CHECK_PLAYER(playerId);
 
                 Sim.Players.Players[playerId].Statistiken[STAT_GEHALT].SetAtPastDay(gehalt);
             } break;
@@ -1956,6 +2560,7 @@ void PumpNetwork() {
                 SLONG fracht = 0;
 
                 Message >> playerId >> auftrag >> lm >> fracht;
+                NET_CHECK_PLAYER(playerId);
 
                 Sim.Players.Players[playerId].Statistiken[STAT_AUFTRAEGE].SetAtPastDay(auftrag);
                 Sim.Players.Players[playerId].Statistiken[STAT_LMAUFTRAEGE].SetAtPastDay(lm);
@@ -1985,6 +2590,13 @@ void PumpNetwork() {
                 // Something is wrong
                 hprintf("Unknown Message %lx", MessageType);
                 break;
+            }
+            } catch (const std::exception &e) {
+                AT_Log("Dropping network message 0x%lx: %s", static_cast<unsigned long>(MessageType), e.what());
+            }
+
+            if (Message.HasReadError()) {
+                AT_Log("Network message 0x%lx was shorter than expected or had an invalid size prefix", static_cast<unsigned long>(MessageType));
             }
 
             // if (Message.MemPointer!=Message.MemBufferUsed)

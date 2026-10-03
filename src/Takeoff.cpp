@@ -57,8 +57,11 @@
 #include <SDL_ttf.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <ctime>
 #include <filesystem>
+#include <random>
 #include <fstream>
 
 #ifdef SENTRY
@@ -70,6 +73,121 @@
 #define AT_Info(...) Hdu.HercPrintfMsg(SDL_LOG_PRIORITY_INFO, "Takeoff", __VA_ARGS__)
 #define AT_Log(...) AT_Log_I("Takeoff", __VA_ARGS__)
 
+
+#ifdef _DEBUG
+#include <crtdbg.h>
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+#ifdef __SANITIZE_ADDRESS__
+extern "C" void __sanitizer_print_stack_trace(void);
+#endif
+
+static void NetTestPrintStack(CONTEXT *ctx = nullptr) {
+    HANDLE proc = GetCurrentProcess();
+    SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    SymInitialize(proc, nullptr, TRUE);
+    void *frames[64];
+    USHORT n = 0;
+    if (ctx != nullptr) {
+        STACKFRAME64 sf{};
+        sf.AddrPC.Offset = ctx->Rip; sf.AddrPC.Mode = AddrModeFlat;
+        sf.AddrFrame.Offset = ctx->Rbp; sf.AddrFrame.Mode = AddrModeFlat;
+        sf.AddrStack.Offset = ctx->Rsp; sf.AddrStack.Mode = AddrModeFlat;
+        CONTEXT c = *ctx;
+        while (n < 64 && StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, GetCurrentThread(), &sf, &c, nullptr, SymFunctionTableAccess64, SymGetModuleBase64, nullptr)) {
+            frames[n++] = reinterpret_cast<void *>(sf.AddrPC.Offset);
+        }
+    } else {
+        n = CaptureStackBackTrace(0, 64, frames, nullptr);
+    }
+    alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 512];
+    for (USHORT i = 0; i < n; i++) {
+        auto *sym = reinterpret_cast<SYMBOL_INFO *>(buf);
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 500;
+        DWORD64 disp = 0;
+        DWORD ldisp = 0;
+        IMAGEHLP_LINE64 line{};
+        line.SizeOfStruct = sizeof(line);
+        const DWORD64 addr = reinterpret_cast<DWORD64>(frames[i]);
+        const bool hasSym = SymFromAddr(proc, addr, &disp, sym) != FALSE;
+        const bool hasLine = SymGetLineFromAddr64(proc, addr, &ldisp, &line) != FALSE;
+        fprintf(stderr, "  #%u %s %s:%lu\n", static_cast<unsigned>(i), hasSym ? sym->Name : "?", hasLine ? line.FileName : "?", hasLine ? line.LineNumber : 0UL);
+    }
+    fflush(stderr);
+}
+// /nettest: CRT assertions must not pop up a modal dialog. Print message + stack, write a minidump, exit(33).
+static int NetTestCrtHook(int reportType, char *message, int *returnValue) {
+    if (reportType == _CRT_WARN) {
+        return FALSE;
+    }
+    fprintf(stderr, "\nNETTEST CRT REPORT (type %d): %s\n", reportType, message != nullptr ? message : "(null)");
+    fflush(stderr);
+    AT_Log_I("NETTEST", "CRT report: %s", message != nullptr ? message : "(null)");
+    if (IsDebuggerPresent() != FALSE) {
+        __debugbreak(); // tools\dbgrun.ps1 prints the stack with line numbers
+    }
+    NetTestPrintStack();
+    const char *logFile = getenv("AT_LOG_FILE");
+    std::string dumpPath = std::string(logFile != nullptr ? logFile : "nettest") + ".crt.dmp";
+    HANDLE f = CreateFileA(dumpPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), f,
+                          static_cast<MINIDUMP_TYPE>(MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithDataSegs), nullptr, nullptr, nullptr);
+        CloseHandle(f);
+    }
+    AT_Log_I("NETTEST", "CRT report: %s", message != nullptr ? message : "(null)");
+    fflush(nullptr);
+    *returnValue = 0;
+    _exit(33);
+    return TRUE;
+}
+
+static LONG WINAPI NetTestSehFilter(EXCEPTION_POINTERS *ep) {
+    fprintf(stderr, "\nNETTEST SEH EXCEPTION code=0x%08lx addr=%p\n", ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2) {
+        fprintf(stderr, "  access violation: %s address %p\n", ep->ExceptionRecord->ExceptionInformation[0] == 0 ? "read" : "write",
+                (void *)ep->ExceptionRecord->ExceptionInformation[1]);
+    }
+    NetTestPrintStack(ep->ContextRecord);
+    const char *logFile = getenv("AT_LOG_FILE");
+    std::string dumpPath = std::string(logFile != nullptr ? logFile : "nettest") + ".seh.dmp";
+    HANDLE f = CreateFileA(dumpPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mei{GetCurrentThreadId(), ep, FALSE};
+        MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), f,
+                          static_cast<MINIDUMP_TYPE>(MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithDataSegs), &mei, nullptr, nullptr);
+        CloseHandle(f);
+    }
+    fflush(nullptr);
+    _exit(34);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static LONG CALLBACK NetTestVehFilter(EXCEPTION_POINTERS *ep) {
+    const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_STACK_OVERFLOW || code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_INT_DIVIDE_BY_ZERO ||
+        code == EXCEPTION_ARRAY_BOUNDS_EXCEEDED || code == 0xC0000374 || code == 0xC0000409) {
+        return NetTestSehFilter(ep);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void NetTestInstallCrashHandling() {
+    SetUnhandledExceptionFilter(NetTestSehFilter);
+    AddVectoredExceptionHandler(1, NetTestVehFilter);
+    SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    _CrtSetReportHook2(_CRT_RPTHOOK_INSTALL, NetTestCrtHook);
+    for (int t : {_CRT_WARN, _CRT_ERROR, _CRT_ASSERT}) {
+        _CrtSetReportMode(t, _CRTDBG_MODE_FILE | _CRTDBG_MODE_DEBUG);
+        _CrtSetReportFile(t, _CRTDBG_FILE_STDERR);
+    }
+}
+#else
+static void NetTestInstallCrashHandling() {}
+#endif
 class TeakLibException;
 extern SBNetwork gNetwork;
 
@@ -344,6 +462,57 @@ void CTakeOffApp::CLI(int argc, char *argv[]) {
                 gAutoQuitOnDay = 99; /* auto-quit in freegame */
             }
         }
+
+        // Multiplayer repro harness:
+        //   /nettest host <port>
+        //   /nettest client <ip> <port>
+        //   /nettestdays N       quit with exit code 0 after N game days
+        //   /nettestspeed S      GameSpeed of the local human (1..5, default 5 = max speed)
+        //   /nettestmonkey SEED  the local human wanders through rooms and clicks at random (0 = off)
+        //   /nettestturbo N      simulation runs N times faster than the max network speed (default 1)
+        //   /nettestfuzz N       replay every received game message N times with random damage (0 = off)
+        //   /headless            force SDL dummy video/audio drivers (implied by /nettest)
+        if (stricmp(Argument, "/nettest") == 0 && i + 1 < argc) {
+            const char *role = argv[++i];
+            if (stricmp(role, "host") == 0) {
+                gNetTestMode = 1;
+                if (i + 1 < argc) {
+                    gNetTestPort = atoi(argv[++i]);
+                }
+            } else if (stricmp(role, "client") == 0) {
+                gNetTestMode = 2;
+                if (i + 1 < argc) {
+                    gNetTestIP = argv[++i];
+                }
+                if (i + 1 < argc) {
+                    gNetTestPort = atoi(argv[++i]);
+                }
+            }
+            NetTestInstallCrashHandling();
+            CheatAutoSkip = 1;
+            SDL_setenv("SDL_VIDEODRIVER", "dummy", 0);
+            SDL_setenv("SDL_AUDIODRIVER", "dummy", 0);
+        }
+        if (stricmp(Argument, "/nettestdays") == 0 && i + 1 < argc) {
+            gNetTestDays = atoi(argv[++i]);
+        }
+        if (stricmp(Argument, "/nettestspeed") == 0 && i + 1 < argc) {
+            gNetTestSpeed = atoi(argv[++i]);
+        }
+        if (stricmp(Argument, "/nettestmonkey") == 0 && i + 1 < argc) {
+            gNetTestMonkey = atoi(argv[++i]);
+        }
+        if (stricmp(Argument, "/nettestturbo") == 0 && i + 1 < argc) {
+            gNetTestTurbo = max(1, atoi(argv[++i]));
+        }
+        if (stricmp(Argument, "/nettestfuzz") == 0 && i + 1 < argc) {
+            gNetTestFuzz = atoi(argv[++i]);
+        }
+        if (stricmp(Argument, "/headless") == 0) {
+            SDL_setenv("SDL_VIDEODRIVER", "dummy", 1);
+            SDL_setenv("SDL_AUDIODRIVER", "dummy", 1);
+        }
+
         if (stricmp(Argument, "/testbot") == 0) {
             gAutoBotDiff = 3;
 
@@ -426,7 +595,7 @@ void CTakeOffApp::ReadOptions(int argc, char *argv[]) {
 
     // Write registry and move on
 
-    if (gQuickTestRun == 0) {
+    if (gQuickTestRun == 0 && gNetTestMode == 0) {
         reg.WriteFile();
     }
 }
@@ -479,7 +648,15 @@ void CTakeOffApp::InitInstance(int argc, char *argv[]) {
         static_cast<SLONG>((DoesFileExist(FullFilename("builds.csv", ExcelPath)) == 0) && (DoesFileExist(FullFilename("relation.csv", ExcelPath))) == 0);
 
     Sim.LoadOptions();
-    if (gQuickTestRun == 0) {
+    if (gNetTestMode != 0) {
+        // Harness: windowed, no sound, no intro, no autosave (two processes share the savegame folder), never write options
+        Sim.Options.OptionFullscreen = 1;
+        Sim.Options.OptionDigiSound = FALSE;
+        Sim.Options.OptionViewedIntro = 1;
+        Sim.Options.OptionAutosave = 0;
+        AT_Log("NETTEST: mode=%ld ip=%s port=%ld days=%ld speed=%ld", gNetTestMode, (LPCTSTR)gNetTestIP, gNetTestPort, gNetTestDays, gNetTestSpeed);
+    }
+    if (gQuickTestRun == 0 && gNetTestMode == 0) {
         Sim.SaveOptions();
     }
 
@@ -951,10 +1128,107 @@ void CTakeOffApp::InitInstance(int argc, char *argv[]) {
     GameLoop(nullptr);
 
     // Closing
-    Sim.SaveOptions();
+    if (gNetTestMode == 0) {
+        Sim.SaveOptions();
+    }
     if (FrameWnd != nullptr) {
         delete FrameWnd;
         FrameWnd = nullptr;
+    }
+}
+
+//--------------------------------------------------------------------------------------------
+// /nettestmonkey: lets the local human player wander through the rooms of the airport and
+// move/click the mouse at random, so the room code runs on host and client like in a real
+// multiplayer game. Uses its own random generator, the game's random numbers stay untouched.
+//--------------------------------------------------------------------------------------------
+static void NetTestMonkeyStep() {
+    static std::mt19937 Rng(static_cast<unsigned>(gNetTestMonkey + gNetTestMode));
+    static SLONG NextAction = 0;
+    static SLONG ActionsInRoom = 0;
+
+    if (gNetTestMonkey == 0 || FrameWnd == nullptr || Sim.Gamestate != (GAMESTATE_PLAYING | GAMESTATE_WORKING)) {
+        return;
+    }
+    // Not before the morning meeting is over (Sim.bNoTime) and not during the evening
+    if (Sim.GetHour() < 9 || Sim.GetHour() >= 18 || Sim.CallItADay != 0 || Sim.bNoTime != 0 || (Sim.GetHour() == 9 && Sim.GetMinute() < 5)) {
+        return;
+    }
+
+    PLAYER &qPlayer = Sim.Players.Players[Sim.localPlayer];
+    if (qPlayer.IsOut != 0) {
+        return;
+    }
+
+    const SLONG Now = AtGetTime();
+    if (Now < NextAction) {
+        return;
+    }
+    // Negative seed: the scenario from issue #29, host sits in his office, client hovers over the Last Minute notes
+    const BOOL bLastMinute = gNetTestMonkey < 0;
+    NextAction = Now + (bLastMinute ? 50 : 100) + static_cast<SLONG>(Rng() % (bLastMinute ? 150 : 300));
+
+    // Rooms a human usually visits. Aufsicht (= call it a day) and the options are left out on purpose.
+    static const SLONG Rooms[] = {ROOM_LAST_MINUTE, ROOM_REISEBUERO, ROOM_FRACHT,   ROOM_MAKLER,   ROOM_BANK,      ROOM_SHOP1,
+                                  ROOM_ARAB_AIR,    ROOM_WERBUNG,    ROOM_KIOSK,    ROOM_ROUTEBOX, ROOM_MUSEUM,    ROOM_WERKSTATT,
+                                  ROOM_RICKS,       ROOM_SABOTAGE,   ROOM_BURO_A,   ROOM_PERSONAL_A};
+
+    const UWORD Room = qPlayer.GetRoom();
+    if (Room == ROOM_AUFSICHT) {
+        return; // handled by CheatAutoSkip
+    }
+    if (Room == ROOM_AIRPORT || Room == 0) {
+        if ((qPlayer.Locations[1] & (ROOM_ENTERING | ROOM_LEAVING)) != 0) {
+            return; // still on the way
+        }
+        SLONG NewRoom = Rooms[Rng() % (sizeof(Rooms) / sizeof(Rooms[0]))];
+        if (bLastMinute) {
+            NewRoom = (Sim.bIsHost != 0) ? ROOM_BURO_A : ROOM_LAST_MINUTE;
+        }
+        if (NewRoom == ROOM_BURO_A || NewRoom == ROOM_PERSONAL_A) {
+            NewRoom += Sim.localPlayer * 10;
+        }
+        AT_Log("NETTEST monkey: entering room %ld", NewRoom);
+        qPlayer.EnterRoom(NewRoom);
+        ActionsInRoom = 0;
+        return;
+    }
+
+    // Inside of a room: hover, click and sometimes cancel; leave after a while
+    ActionsInRoom++;
+    CPoint pt(static_cast<SLONG>(Rng() % 640), static_cast<SLONG>(Rng() % 440)); // stay out of the status bar
+    SLONG Dice = static_cast<SLONG>(Rng() % 100);
+    if (bLastMinute) {
+        static const SLONG ZettelPos[10 * 2] = {66, 79, 126, 212, 145, 116, 33, 250, 128, 289, 15, 150, 346, 331, 40, 113, 449, 126, 245, 307};
+        if (Room == ROOM_LAST_MINUTE && Dice < 90) {
+            const SLONG c = static_cast<SLONG>(Rng() % 10);
+            pt = CPoint(ZettelPos[c * 2] + 5 + static_cast<SLONG>(Rng() % 40), ZettelPos[c * 2 + 1] + 5 + static_cast<SLONG>(Rng() % 25));
+        }
+        Dice = (Dice % 50 == 0) ? 0 : 99; // take an order now and then, otherwise only hover
+        ActionsInRoom = 0;                // never leave
+        if (Rng() % 50 == 0) {
+            AT_Log("NETTEST monkey: in room %u", Room);
+        }
+    }
+
+    FrameWnd->OnMouseMove(0, pt);
+    if (Dice < 25) {
+        FrameWnd->OnLButtonDown(0, pt);
+        FrameWnd->OnLButtonUp(0, pt);
+    } else if (Dice < 33) {
+        FrameWnd->OnRButtonDown(0, pt);
+        FrameWnd->OnRButtonUp(0, pt);
+    }
+
+    if (ActionsInRoom > 25 + static_cast<SLONG>(Rng() % 25)) {
+        AT_Log("NETTEST monkey: leaving room %u", Room);
+        // Right clicks close menus and dialogs, then leave like the player would
+        FrameWnd->OnRButtonDown(0, CPoint(320, 220));
+        FrameWnd->OnRButtonUp(0, CPoint(320, 220));
+        if (qPlayer.GetRoom() == Room) {
+            qPlayer.LeaveRoom();
+        }
+        ActionsInRoom = 0;
     }
 }
 
@@ -1011,7 +1285,10 @@ void CTakeOffApp::GameLoop(void * /*unused*/) {
                 }
 
                 // Titelmenü anzeigen:
-                if ((Sim.Options.OptionViewedIntro != 0) || IntroPath.GetLength() == 0) {
+                if (gNetTestMode != 0) {
+                    // Harness: skip the title menu, NewGamePopup drives itself
+                    Sim.Gamestate = GAMESTATE_TITLE | GAMESTATE_DONE;
+                } else if ((Sim.Options.OptionViewedIntro != 0) || IntroPath.GetLength() == 0) {
                     Sim.Gamestate = GAMESTATE_TITLE | GAMESTATE_WORKING;
                     TopWin = new TitlePopup(FALSE, 0);
                 } else {
@@ -1091,7 +1368,7 @@ void CTakeOffApp::GameLoop(void * /*unused*/) {
                         Sim.IsTutorial = FALSE;
                         // Sim.bNoTime = FALSE;
                         // Sim.DayState = 2;
-                        Sim.Players.Players[Sim.localPlayer].GameSpeed = 5;
+                        Sim.Players.Players[Sim.localPlayer].GameSpeed = (gNetTestMode != 0) ? gNetTestSpeed : 5;
                     } else {
                         if (Sim.Difficulty == DIFF_TUTORIAL) {
                             for (c = 0; c < Sim.Players.AnzPlayers; c++) {
@@ -1333,6 +1610,9 @@ void CTakeOffApp::GameLoop(void * /*unused*/) {
                         printf("Takeoff.cpp: Default case should not be reached.");
                         DebugBreak();
                     }
+                    if (gNetTestMode != 0) {
+                        Multiplier *= gNetTestTurbo;
+                    }
                     NumSimSteps *= Multiplier;
                     Faktor *= Multiplier;
                 }
@@ -1449,6 +1729,23 @@ void CTakeOffApp::GameLoop(void * /*unused*/) {
                             gTimerCorrection++;
                         }
                     }
+                }
+
+                if (gNetTestMode != 0) {
+                    // Harness: progress log (every 10 game minutes) and exit after N days (host runs one day longer so the client leaves first)
+                    static SLONG LastLogged = -1;
+                    const SLONG Stamp = Sim.Date * 10000 + Sim.GetHour() * 100 + Sim.GetMinute() / 10 * 10;
+                    if (Stamp != LastLogged) {
+                        LastLogged = Stamp;
+                        AT_Log("NETTEST: day=%ld time=%02ld:%02ld", Sim.Date, Sim.GetHour(), Sim.GetMinute());
+                    }
+                    if (Sim.Date >= gNetTestDays + ((gNetTestMode == 1) ? 1 : 0)) {
+                        AT_Log("NETTEST: reached day %ld, exiting with code 0", Sim.Date);
+                        fflush(nullptr);
+                        _exit(0);
+                    }
+                    bActive = TRUE;
+                    NetTestMonkeyStep();
                 }
 
                 // Sind noch Simulationsschritte offen ?
@@ -1798,7 +2095,9 @@ void CTakeOffApp::GameLoop(void * /*unused*/) {
                                                 }
 
                                                 qPlayer.Locations[d] = 0;
-                                                qPlayer.Locations[d - 1] = UWORD((qPlayer.Locations[d - 1] & (~ROOM_LEAVING)) | ROOM_ENTERING);
+                                                if (d > 0) {
+                                                    qPlayer.Locations[d - 1] = UWORD((qPlayer.Locations[d - 1] & (~ROOM_LEAVING)) | ROOM_ENTERING);
+                                                }
                                                 qPlayer.CalcRoom();
 
                                                 if ((Sim.bNetwork != 0) && (Sim.bIsHost != 0)) {

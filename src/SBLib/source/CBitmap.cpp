@@ -286,7 +286,23 @@ ULONG SB_CBitmapCore::Clear(SB_Hardwarecolor hwcolor, const RECT *pRect) {
     return result;
 }
 
+// Callers (e.g. the route arrows of the tooltips) don't clip. Writing outside of the surface corrupts the heap.
+static bool IsPixelOutside(SDL_Surface *surface, SLONG x, SLONG y) {
+    if (x >= 0 && y >= 0 && x < surface->w && y < surface->h) {
+        return false;
+    }
+    static SLONG LogCount = 0;
+    if (LogCount < 20) {
+        LogCount++;
+        AT_Log("Pixel access outside of bitmap: %ld,%ld (size %d x %d)", x, y, surface->w, surface->h);
+    }
+    return true;
+}
+
 ULONG SB_CBitmapCore::SetPixel(SLONG x, SLONG y, SB_Hardwarecolor hwcolor) {
+    if (lpDDSurface == nullptr || IsPixelOutside(lpDDSurface, x, y)) {
+        return 1;
+    }
     if (SDL_MUSTLOCK(lpDDSurface) && SDL_LockSurface(lpDDSurface) < 0) {
         return 1;
     }
@@ -308,6 +324,9 @@ ULONG SB_CBitmapCore::SetPixel(SLONG x, SLONG y, SB_Hardwarecolor hwcolor) {
 }
 
 ULONG SB_CBitmapCore::GetPixel(SLONG x, SLONG y) {
+    if (lpDDSurface == nullptr || IsPixelOutside(lpDDSurface, x, y)) {
+        return 0;
+    }
     if (SDL_MUSTLOCK(lpDDSurface) && SDL_LockSurface(lpDDSurface) < 0) {
         return 1;
     }

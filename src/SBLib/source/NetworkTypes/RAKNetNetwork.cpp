@@ -24,17 +24,39 @@ void SerializePacket(ATPacket *p, BitStream *data) {
     }
 }
 
-void DeserializePacket(unsigned char *data, unsigned int length, ATPacket *packet) {
+// Returns false if the packet is truncated or lies about its length. In that case packet->data is nullptr and
+// packet->dataLength is 0, so there is nothing for the caller to free.
+// On success the caller owns packet->data (allocated with new[]).
+bool DeserializePacket(unsigned char *data, unsigned int length, ATPacket *packet) {
+    packet->messageType = 0;
+    packet->peerID = 0;
+    packet->dataLength = 0;
+    packet->data = nullptr;
+
     BitStream dataStream(data, length, false);
-    dataStream.Read(packet->messageType);
-    dataStream.Read(packet->peerID);
-    dataStream.Read(packet->dataLength);
+    ULONG dataLength = 0;
 
-    packet->data = new UBYTE[packet->dataLength];
-
-    for (int i = 0; i < packet->dataLength; i++) {
-        dataStream.Read(packet->data[i]);
+    if (!dataStream.Read(packet->messageType) || !dataStream.Read(packet->peerID) || !dataStream.Read(dataLength)) {
+        return false;
     }
+
+    // Every payload byte takes 8 bits of what is left in the stream:
+    if (static_cast<unsigned long long>(dataLength) * 8 > dataStream.GetNumberOfUnreadBits()) {
+        return false;
+    }
+
+    UBYTE *payload = new UBYTE[dataLength + 1]();
+
+    for (ULONG i = 0; i < dataLength; i++) {
+        if (!dataStream.Read(payload[i])) {
+            delete[] payload;
+            return false;
+        }
+    }
+
+    packet->data = payload;
+    packet->dataLength = dataLength;
+    return true;
 }
 
 #define MAX_TIMEOUT 8
@@ -379,7 +401,7 @@ bool RAKNetNetwork::Send(BUFFER<UBYTE> &buffer, ULONG length, ULONG peerID, bool
     BitStream data;
     SerializePacket(&a, &data);
 
-    if (peerID) {
+    if (peerID && length >= 4) {
         AT_Log("SEND PRIVATE: SBNETWORK_MESSAGE ID: - ID %x TO: %x", (a.data[3] << 24) | (a.data[2] << 16) | (a.data[1] << 8) | (a.data[0]), peerID);
     }
 
@@ -424,6 +446,11 @@ bool RAKNetNetwork::Receive(UBYTE **buffer, ULONG &size) {
         if (p == nullptr)
             return false;
 
+        if (p->length == 0 || p->data == nullptr) {
+            mMaster->DeallocatePacket(p);
+            return false;
+        }
+
         switch (p->data[0]) {
         case ID_DISCONNECTION_NOTIFICATION:
         case ID_CONNECTION_LOST: {
@@ -451,7 +478,7 @@ bool RAKNetNetwork::Receive(UBYTE **buffer, ULONG &size) {
                 memcpy(*buffer, &dp, size);
 
                 mPlayers.RemoveLastAccessed();
-                delete disconnectedPlayer;
+                delete static_cast<RAKNetworkPlayer *>(disconnectedPlayer); // SBNetworkPlayer has no virtual destructor
             }
             if (mState != SBSessionEnum::SBNETWORK_SESSION_MASTER && *mHost == p->guid) { // The server disconnected
                 isHostMigrating = true;
@@ -461,10 +488,14 @@ bool RAKNetNetwork::Receive(UBYTE **buffer, ULONG &size) {
         case SBEventEnum::SBNETWORK_MESSAGE: // Normal packet
         {
             ATPacket packet{};
-            DeserializePacket(p->data, p->length, &packet);
+            if (!DeserializePacket(p->data, p->length, &packet)) {
+                AT_Log("Dropping malformed SBNETWORK_MESSAGE (%u bytes)", p->length);
+                break; // The packet is freed below
+            }
 
             // Check if the package was meant for us. 0 for broadcast
             if (packet.peerID && packet.peerID != mLocalID) {
+                delete[] packet.data;
                 break;
             }
 
@@ -478,7 +509,11 @@ bool RAKNetNetwork::Receive(UBYTE **buffer, ULONG &size) {
             RAKNetworkPlayer *player = new RAKNetworkPlayer();
             BitStream b(p->data, p->length, true);
             b.IgnoreBytes(1); // Net event ID
-            b.Read(player->ID);
+            if (!b.Read(player->ID)) {
+                AT_Log("Dropping malformed SBNETWORK_ESTABLISH_CONNECTION");
+                delete player;
+                break;
+            }
             player->peer = p->guid; // mMaster->GetGuidFromSystemAddress(p->systemAddress);
             mPlayers.Add(player);
 
@@ -504,6 +539,10 @@ bool RAKNetNetwork::Receive(UBYTE **buffer, ULONG &size) {
         }
         case SBEventEnum::SBNETWORK_JOINED: // We joined the server, or someone else joined the master server
             if (mState == SBSessionEnum::SBNETWORK_SESSION_CLIENT) {
+                if (p->length < sizeof(RAKNetworkPeer)) {
+                    AT_Log("Dropping malformed SBNETWORK_JOINED (%u bytes)", p->length);
+                    break;
+                }
                 auto *nPeer = reinterpret_cast<RAKNetworkPeer *>(p->data);
                 RAKNetworkPlayer *player = new RAKNetworkPlayer();
                 player->ID = nPeer->ID;

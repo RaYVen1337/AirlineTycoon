@@ -699,7 +699,8 @@ void CAufsicht::OnPaint() {
     if (Sim.Date == gAutoQuitOnDay) {
         exit(0);
     }
-    if (CheatAutoSkip != 0 && (gQuickTestRun > 0 || (Sim.Date % 100) != 99)) {
+    // In network games TryLeaveAufsicht() repaints while waiting for the other players; don't re-trigger (endless recursion)
+    if (CheatAutoSkip != 0 && (gQuickTestRun > 0 || (Sim.Date % 100) != 99) && !bExitASAP) {
         OnRButtonDown(0, CPoint());
         qPlayer.CallItADay = TRUE;
     }

@@ -31,7 +31,9 @@ HDU::HDU() : Log(nullptr) {
     BUFFER_V<char> path(strlen(base) + strlen(file) + 1);
     strcpy(path.data(), base);
     strcat(path.data(), file);
-    Log = fopen(path.data(), "w");
+    // Harness: AT_LOG_FILE overrides the log location so that several instances can share one install folder
+    const char *logOverride = getenv("AT_LOG_FILE");
+    Log = fopen((logOverride != nullptr && logOverride[0] != 0) ? logOverride : path.data(), "w");
     // Log = stdout;
     SDL_free(base);
 

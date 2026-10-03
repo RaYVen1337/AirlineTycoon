@@ -25,6 +25,20 @@ if (MSVC)
     add_link_options("/OPT:ICF")
 endif()
 
+option(AT_ASAN "Build with AddressSanitizer (MSVC only; for the multiplayer repro harness)" OFF)
+if (MSVC AND AT_ASAN)
+    add_compile_options("/fsanitize=address")
+    # /RTC1 is incompatible with ASan
+    string(REGEX REPLACE "/RTC[1csu]+" "" CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
+    string(REGEX REPLACE "/RTC[1csu]+" "" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+    add_link_options("/INCREMENTAL:NO")
+    # ASan + Debug inflates stack frames; the default 1 MB main thread stack overflows
+    add_link_options("/STACK:16777216")
+    # Directory of cl.exe also holds the ASan runtime DLLs
+    get_filename_component(AT_ASAN_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    message(STATUS "AddressSanitizer enabled, runtime DLL dir: ${AT_ASAN_BIN_DIR}")
+endif()
+
 if (WIN32)
     # Set and bind SDL folders
     set(SDL2_PATH "${CMAKE_MODULE_PATH}/sdl2")
